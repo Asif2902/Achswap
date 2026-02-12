@@ -15,6 +15,27 @@ import { defaultTokens, getTokensByChainId } from "@/data/tokens";
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 
+// Chain-specific configuration - add new chains here
+const chainConfig: Record<number, {
+  nativeSymbol: string;
+  wrappedSymbol: string;
+  rpcUrl: string;
+}> = {
+  5042002: {
+    nativeSymbol: 'USDC',
+    wrappedSymbol: 'wUSDC',
+    rpcUrl: 'https://rpc.testnet.arc.network',
+  },
+};
+
+function getChainConfig(chainId: number) {
+  return chainConfig[chainId] || {
+    nativeSymbol: 'USDC',
+    wrappedSymbol: 'wUSDC',
+    rpcUrl: 'https://rpc.testnet.arc.network',
+  };
+}
+
 // ERC20 ABI for token operations
 const ERC20_ABI = [
   "function name() view returns (string)",
@@ -25,7 +46,7 @@ const ERC20_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
 
-// Wrapped token contract ABI for deposit/withdraw (wUSDC/wUSDT)
+// Wrapped token contract ABI for deposit/withdraw
 const WRAPPED_TOKEN_ABI = [
   "function deposit() payable",
   "function withdraw(uint256 amount) returns (bool)",
@@ -76,13 +97,11 @@ export default function Swap() {
   useEffect(() => {
     if (tokens.length === 0 || !chainId) return;
 
+    const config = getChainConfig(chainId);
+
     // Set defaults only if not already set or if chain changed
     if (!fromToken || fromToken.chainId !== chainId) {
-      // For Stable Testnet (2201): default to gUSDT
-      // For ARC Testnet (5042002): default to USDC
-      const defaultFrom = chainId === 2201 
-        ? tokens.find(t => t.symbol === 'gUSDT')
-        : tokens.find(t => t.symbol === 'USDC');
+      const defaultFrom = tokens.find(t => t.symbol === config.nativeSymbol);
       if (defaultFrom) setFromToken(defaultFrom);
     }
 
@@ -102,11 +121,10 @@ export default function Swap() {
         return;
       }
 
-      // Handle wrap/unwrap - 1:1 ratio (supports both chains)
-      const isWrap = (fromToken.symbol === 'USDC' && toToken.symbol === 'wUSDC') ||
-                     (fromToken.symbol === 'gUSDT' && toToken.symbol === 'wUSDT');
-      const isUnwrap = (fromToken.symbol === 'wUSDC' && toToken.symbol === 'USDC') ||
-                       (fromToken.symbol === 'wUSDT' && toToken.symbol === 'gUSDT');
+      // Handle wrap/unwrap - 1:1 ratio (chain-specific)
+      const config = getChainConfig(chainId);
+      const isWrap = fromToken.symbol === config.nativeSymbol && toToken.symbol === config.wrappedSymbol;
+      const isUnwrap = fromToken.symbol === config.wrappedSymbol && toToken.symbol === config.nativeSymbol;
 
       if (isWrap || isUnwrap) {
         setToAmount(fromAmount);
@@ -131,8 +149,9 @@ export default function Swap() {
         const isFromNative = fromToken.address === "0x0000000000000000000000000000000000000000";
         const isToNative = toToken.address === "0x0000000000000000000000000000000000000000";
 
-        // Get wrapped token address for routing (wUSDC for ARC, wUSDT for Stable)
-        const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+        // Get wrapped token address for routing (chain-specific)
+        const config = getChainConfig(chainId);
+        const wrappedSymbol = config.wrappedSymbol;
         const wrappedTokenData = tokens.find(t => t.symbol === wrappedSymbol);
         const wrappedAddress = wrappedTokenData?.address;
 
@@ -278,9 +297,8 @@ export default function Swap() {
       }
 
       // Use public RPC for token data (no wallet needed) - use chain-specific RPC
-      const rpcUrl = chainId === 2201 
-        ? 'https://rpc.testnet.stable.xyz/' 
-        : 'https://rpc.testnet.arc.network';
+      const config = getChainConfig(chainId);
+      const rpcUrl = config.rpcUrl;
       const provider = new BrowserProvider({
         request: async ({ method, params }: any) => {
           const response = await fetch(rpcUrl, {
@@ -532,11 +550,10 @@ export default function Swap() {
   const handleSwap = async () => {
     if (!fromToken || !toToken || !fromAmount || parseFloat(fromAmount) <= 0) return;
 
-    // Check if this is a wrap/unwrap operation (supports both chains)
-    const isWrap = (fromToken.symbol === 'USDC' && toToken.symbol === 'wUSDC') ||
-                   (fromToken.symbol === 'gUSDT' && toToken.symbol === 'wUSDT');
-    const isUnwrap = (fromToken.symbol === 'wUSDC' && toToken.symbol === 'USDC') ||
-                     (fromToken.symbol === 'wUSDT' && toToken.symbol === 'gUSDT');
+    // Check if this is a wrap/unwrap operation (chain-specific)
+    const config = getChainConfig(chainId);
+    const isWrap = fromToken.symbol === config.nativeSymbol && toToken.symbol === config.wrappedSymbol;
+    const isUnwrap = fromToken.symbol === config.wrappedSymbol && toToken.symbol === config.nativeSymbol;
 
     if (isWrap) {
       await handleWrap(fromAmount);
@@ -847,8 +864,9 @@ export default function Swap() {
   }
 
   // Get native and wrapped tokens based on current chain
-  const nativeSymbol = chainId === 2201 ? 'gUSDT' : 'USDC';
-  const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+  const chainConfig = getChainConfig(chainId);
+  const nativeSymbol = chainConfig.nativeSymbol;
+  const wrappedSymbol = chainConfig.wrappedSymbol;
   const nativeToken = tokens.find(t => t.symbol === nativeSymbol);
   const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
 

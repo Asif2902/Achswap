@@ -12,6 +12,15 @@ import { defaultTokens, getTokensByChainId } from "@/data/tokens";
 import { formatAmount, parseAmount, calculateRatio } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 
+// Chain-specific configuration - add new chains here
+const chainWrappedTokens: Record<number, string> = {
+  5042002: 'wUSDC',
+};
+
+function getWrappedTokenSymbol(chainId: number): string {
+  return chainWrappedTokens[chainId] || 'wUSDC';
+}
+
 const ERC20_ABI = [
   "function name() view returns (string)",
   "function symbol() view returns (string)",
@@ -81,8 +90,8 @@ export default function AddLiquidity() {
         const provider = new BrowserProvider(window.ethereum);
         const factory = new Contract(contracts.factory, FACTORY_ABI, provider);
 
-        // Get wrapped token for native conversion (wUSDC for ARC, wUSDT for Stable)
-        const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+        // Get wrapped token for native conversion (chain-specific)
+        const wrappedSymbol = getWrappedTokenSymbol(chainId);
         const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
         const wrappedAddress = wrappedToken?.address;
 
@@ -220,9 +229,10 @@ export default function AddLiquidity() {
       }
 
       // Use public RPC for token data (no wallet needed) - chain-specific
-      const rpcUrl = chainId === 2201 
-        ? 'https://rpc.testnet.stable.xyz/' 
-        : 'https://rpc.testnet.arc.network';
+      const rpcUrls: Record<number, string> = {
+        5042002: 'https://rpc.testnet.arc.network',
+      };
+      const rpcUrl = rpcUrls[chainId] || 'https://rpc.testnet.arc.network';
       const provider = new BrowserProvider({
         request: async ({ method, params }: any) => {
           const response = await fetch(rpcUrl, {
@@ -379,7 +389,7 @@ export default function AddLiquidity() {
       const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
 
       // Get wrapped token for native conversion (chain-specific)
-      const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+      const wrappedSymbol = getWrappedTokenSymbol(chainId);
       const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
       const wrappedAddress = wrappedToken?.address;
       

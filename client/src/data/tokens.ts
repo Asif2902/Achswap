@@ -31,39 +31,13 @@ const arcTestnetTokens: Token[] = [
   }
 ];
 
-// Stable Testnet tokens (Chain ID: 2201)
-const stableTestnetTokens: Token[] = [
-  {
-    address: "0x0000000000000000000000000000000000000000",
-    name: "gUSDT",
-    symbol: "gUSDT",
-    decimals: 18,
-    logoURI: "/img/logos/gusdt.png",
-    verified: true,
-    chainId: 2201
-  },
-  {
-    address: "0x1ddEaa3Ead136a70D6D52c99cFd9e336babcCaC1",
-    name: "Wrapped USDT",
-    symbol: "wUSDT",
-    decimals: 18,
-    logoURI: "/img/logos/wusdt.png",
-    verified: true,
-    chainId: 2201
-  },
-  {
-    address: "0x8e9FCc09060286583c39D7b1fA42b3EA04E83BaC",
-    name: "Achswap Token",
-    symbol: "ACHS",
-    decimals: 18,
-    logoURI: "/img/logos/achs-token.png",
-    verified: true,
-    chainId: 2201
-  }
-];
+// Token lists by chain - add new chain token arrays here
+const tokenListsByChain: Record<number, Token[]> = {
+  5042002: arcTestnetTokens,
+};
 
-export const defaultTokens: Token[] = [...arcTestnetTokens, ...stableTestnetTokens];
+export const defaultTokens: Token[] = Object.values(tokenListsByChain).flat();
 
 export function getTokensByChainId(chainId: number): Token[] {
-  return defaultTokens.filter(token => token.chainId === chainId);
+  return tokenListsByChain[chainId] || [];
 }

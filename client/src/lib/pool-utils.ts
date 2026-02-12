@@ -21,6 +21,33 @@ const ERC20_ABI = [
   "function name() external view returns (string)",
 ];
 
+// Chain-specific configuration - add new chains here
+interface ChainConfig {
+  rpcUrl: string;
+  stableTokens: string[];
+  wrappedPairs: [string, string][];
+  symbolMappings: Record<string, string>;
+}
+
+const chainConfigs: Record<number, ChainConfig> = {
+  5042002: {
+    rpcUrl: 'https://rpc.testnet.arc.network',
+    stableTokens: ['USDC', 'wUSDC'],
+    wrappedPairs: [['USDC', 'wUSDC'], ['wUSDC', 'USDC']],
+    symbolMappings: {
+      'wUSDC': 'USDC',
+    },
+  },
+};
+
+function getChainConfig(chainId: number): ChainConfig {
+  const config = chainConfigs[chainId];
+  if (!config) {
+    throw new Error(`No configuration found for chain ID ${chainId}`);
+  }
+  return config;
+}
+
 export interface PoolData {
   pairAddress: string;
   token0: {
@@ -51,9 +78,8 @@ export async function fetchAllPools(
   knownTokens: Token[]
 ): Promise<PoolData[]> {
   try {
-    const rpcUrl = chainId === 2201 
-      ? 'https://rpc.testnet.stable.xyz/' 
-      : 'https://rpc.testnet.arc.network';
+    const chainConfig = getChainConfig(chainId);
+    const rpcUrl = chainConfig.rpcUrl;
 
     const provider = new BrowserProvider({
       request: async ({ method, params }: any) => {
@@ -158,7 +184,7 @@ export async function fetchAllPools(
           token1Name = `Token ${token1Address.substring(0, 6)}`;
         }
 
-        // Skip wrapped token pairs (wUSDC/USDC, wUSDT/gUSDT) - these are wrap tokens, not trading pairs
+        // Skip wrapped token pairs (e.g., wUSDC/USDC) - these are wrap tokens, not trading pairs
         if (isWrappedTokenPair(token0Symbol, token1Symbol, chainId)) {
           console.log(`Skipping wrapped token pair: ${token0Symbol}/${token1Symbol}`);
           continue;
@@ -226,11 +252,8 @@ function calculateTVL(
   chainId: number
 ): number {
   // All stable tokens are pegged to $1 USD
-  // wUSDT, gUSDT, USDT = $1 USD on Stable Testnet
-  // wUSDC, USDC = $1 USD on ARC Testnet
-  const stableTokens = chainId === 2201 
-    ? ['gUSDT', 'wUSDT', 'USDT']
-    : ['USDC', 'wUSDC'];
+  const chainConfig = getChainConfig(chainId);
+  const stableTokens = chainConfig.stableTokens;
 
   const isToken0Stable = stableTokens.includes(token0Symbol);
   const isToken1Stable = stableTokens.includes(token1Symbol);
@@ -252,9 +275,8 @@ function calculateTVL(
 
 function isWrappedTokenPair(token0Symbol: string, token1Symbol: string, chainId: number): boolean {
   // Wrapped tokens are not trading pairs, they're 1:1 wrappers
-  const wrappedPairs = chainId === 2201
-    ? [['gUSDT', 'wUSDT'], ['wUSDT', 'gUSDT']]
-    : [['USDC', 'wUSDC'], ['wUSDC', 'USDC']];
+  const chainConfig = getChainConfig(chainId);
+  const wrappedPairs = chainConfig.wrappedPairs;
   
   return wrappedPairs.some(
     ([t0, t1]) => token0Symbol === t0 && token1Symbol === t1
@@ -263,13 +285,8 @@ function isWrappedTokenPair(token0Symbol: string, token1Symbol: string, chainId:
 
 function getDisplaySymbol(symbol: string, chainId: number): string {
   // Convert wrapped tokens to their unwrapped display names
-  if (chainId === 2201) {
-    if (symbol === 'wUSDT') return 'USDT';
-    if (symbol === 'gUSDT') return 'USDT';
-  } else {
-    if (symbol === 'wUSDC') return 'USDC';
-  }
-  return symbol;
+  const chainConfig = getChainConfig(chainId);
+  return chainConfig.symbolMappings[symbol] || symbol;
 }
 
 export function calculateTotalTVL(pools: PoolData[]): number {

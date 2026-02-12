@@ -24,32 +24,12 @@ export const arcTestnet = defineChain({
   testnet: true,
 });
 
-// Define Stable Testnet chain
-export const stableTestnet = defineChain({
-  id: 2201,
-  name: 'Stable Testnet',
-  nativeCurrency: {
-    decimals: 18,
-    name: 'gUSDT',
-    symbol: 'gUSDT',
-  },
-  rpcUrls: {
-    default: {
-      http: ['https://rpc.testnet.stable.xyz/'],
-    },
-    public: {
-      http: ['https://rpc.testnet.stable.xyz/'],
-    },
-  },
-  blockExplorers: {
-    default: { name: 'Stablescan', url: 'https://testnet.stablescan.xyz' },
-  },
-  testnet: true,
-});
+// Supported chains array - add new chains here
+export const supportedChains = [arcTestnet] as const;
 
 export const config = getDefaultConfig({
   appName: 'Achswap',
   projectId: import.meta.env.VITE_WALLETCONNECT_PROJECT_ID!,
-  chains: [arcTestnet, stableTestnet],
+  chains: [...supportedChains],
   ssr: false,
 });

@@ -4,16 +4,12 @@ export interface ChainContracts {
   explorer: string;
 }
 
+// Contract addresses by chain ID - add new chain contracts here
 export const contractsByChainId: Record<number, ChainContracts> = {
   5042002: {
     factory: "0x7cC023C7184810B84657D55c1943eBfF8603B72B",
     router: "0xB92428D440c335546b69138F7fAF689F5ba8D436",
     explorer: "https://testnet.arcscan.app/tx/"
-  },
-  2201: {
-    factory: "0x774453B7A832c83a1BD4adB4ca1e332107432A8f",
-    router: "0xFb5B0cc9a61E76C5B5c60b52dF092F30B36c547e",
-    explorer: "https://testnet.stablescan.xyz/tx/"
   }
 };
 

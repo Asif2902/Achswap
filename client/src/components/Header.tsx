@@ -2,13 +2,21 @@ import { Link } from "wouter";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { useAccount, useChainId } from "wagmi";
 
+// Chain display configuration - add new chains here
+interface ChainDisplayInfo {
+  name: string;
+  logo: string;
+}
+
+const chainDisplayConfig: Record<number, ChainDisplayInfo> = {
+  5042002: { name: "ARC Testnet", logo: "/img/logos/arc-network.png" },
+};
+
 export function Header() {
   const { isConnected } = useAccount();
   const chainId = useChainId();
 
-  const chainDisplayInfo = chainId === 2201 
-    ? { name: "Stable Testnet", logo: "/img/logos/stable-network.png" }
-    : { name: "ARC Testnet", logo: "/img/logos/arc-network.png" };
+  const chainDisplayInfo = chainDisplayConfig[chainId] || { name: "Unknown Chain", logo: "/img/logos/unknown-token.png" };
 
   return (
     <header className="sticky top-0 z-50 w-full border-b border-border/40 bg-background/80 backdrop-blur-xl supports-[backdrop-filter]:bg-background/60 shadow-lg">

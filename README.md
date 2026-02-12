@@ -72,10 +72,10 @@ Launches the production-ready application
 
 ## Overview
 Achswap is a multi-chain decentralized exchange (DEX) frontend application built with React, Vite, and Web3 technologies. It allows users to:
-- Swap tokens on multiple testnets (ARC Testnet & Stable Testnet)
+- Swap tokens on ARC Testnet
 - Add liquidity to trading pairs
 - Remove liquidity from positions
-- Wrap/unwrap tokens (USDC ↔ wUSDC on ARC, gUSDT ↔ wUSDT on Stable)
+- Wrap/unwrap tokens (USDC ↔ wUSDC)
 
 ## Project Structure
 - **Frontend**: React + TypeScript + Vite
@@ -83,7 +83,6 @@ Achswap is a multi-chain decentralized exchange (DEX) frontend application built
 - **Web3**: wagmi, viem, RainbowKit, ethers.js
 - **Networks**: 
   - ARC Testnet (Chain ID: 5042002)
-  - Stable Testnet (Chain ID: 2201)
 
 
 ## Key Files
@@ -108,21 +107,20 @@ Achswap is a multi-chain decentralized exchange (DEX) frontend application built
 - RPC: https://rpc.testnet.arc.network
 - Default Token Pair: USDC + ACHS
 
-**Stable Testnet (Chain ID: 2201)**
-- Native Token: gUSDT (18 decimals - Gas Token)
-- Wrapped Token: wUSDT (18 decimals)
-- Factory: `0x774453B7A832c83a1BD4adB4ca1e332107432A8f`
-- Router: `0xFb5B0cc9a61E76C5B5c60b52dF092F30B36c547e`
-- Explorer: https://testnet.stablescan.xyz
-- RPC: https://rpc.testnet.stable.xyz/
-- Default Token Pair: gUSDT + ACHS
+### Adding New Chains
+To add a new chain, update the following files:
+1. `client/src/lib/wagmi.ts` - Add chain definition to `supportedChains` array
+2. `client/src/data/tokens.ts` - Add token list to `tokenListsByChain` record
+3. `client/src/lib/contracts.ts` - Add contract addresses to `contractsByChainId` record
+4. `client/src/lib/pool-utils.ts` - Add chain config to `chainConfigs` record
+5. `client/src/components/Header.tsx` - Add chain display info to `chainDisplayConfig` record
 
 ### Chain Switching
 Users can switch between networks using their wallet (MetaMask, etc.). The application automatically:
 - Filters token lists by the active chain
 - Updates router and factory contract addresses
 - Sets appropriate default token pairs per chain
-- Handles wrap/unwrap operations for each chain's native token (USDC/wUSDC for ARC, gUSDT/wUSDT for Stable)
+- Handles wrap/unwrap operations for each chain's native token
 
 ### Token Handling
 - All token imports include chainId field for proper multi-chain filtering
@@ -167,12 +165,10 @@ npm start
 All logo files are stored in `client/public/img/logos/`:
 - `usdc.webp` - USDC token logo
 - `wusdc.png` - Wrapped USDC logo
-- `gusdt.png` - gUSDT token logo
-- `wusdt.png` - Wrapped gUSDT logo
 - `achs-token.png` - Achswap token logo
 - `achswap-logo.png` - Achswap brand logo
 - `arc-network.png` - ARC Testnet network logo
-- `stable-network.png` - Stable Testnet network logo
+- `stable-network.png` - Stable Testnet network logo (removed)
 - `unknown-token.png` - Fallback logo for tokens without custom logo
 
 **Cleanup Completed**: Removed duplicate and unused logo files:
@@ -211,10 +207,10 @@ All logo files are stored in `client/public/img/logos/`:
 
 ### November 23, 2025 - Multi-Chain & Production Polish
 **Chain Integration:**
-- ✅ Stable Testnet (Chain ID: 2201) fully integrated alongside ARC Testnet
+- ✅ Multi-chain architecture for easy addition of new networks
 - ✅ Chain-specific token filtering and contract management
 - ✅ Automatic default token pair selection per chain
-- ✅ Multi-chain wrap/unwrap support (USDC/wUSDC, gUSDT/wUSDT)
+- ✅ Wrap/unwrap support for native tokens
 
 **Transaction Safety:**
 - ✅ 150% gas boost applied to all transactions automatically
@@ -226,7 +222,7 @@ All logo files are stored in `client/public/img/logos/`:
 - ✅ Improved mid-point comparison method for consistent results
 
 **Assets & Cleanup:**
-- ✅ Professional token logos added for Stable Testnet (gUSDT, wUSDT)
+- ✅ Professional token logos added
 - ✅ Removed 2.2MB of duplicate/unused logo files
 - ✅ Consolidated asset organization for cleaner codebase
 - ✅ Logo paths optimized and unified across application

@@ -12,6 +12,15 @@ import { defaultTokens, getTokensByChainId } from "@/data/tokens";
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 
+// Chain-specific configuration - add new chains here
+const chainWrappedTokens: Record<number, string> = {
+  5042002: 'wUSDC',
+};
+
+function getWrappedTokenSymbol(chainId: number): string {
+  return chainWrappedTokens[chainId] || 'wUSDC';
+}
+
 const ERC20_ABI = [
   "function name() view returns (string)",
   "function symbol() view returns (string)",
@@ -84,7 +93,7 @@ export default function RemoveLiquidity() {
         const amount1 = liquidityToRemove * reserve1 / totalSupply;
 
         // Get wrapped token for proper address handling (chain-specific)
-        const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+        const wrappedSymbol = getWrappedTokenSymbol(chainId);
         const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
         const wrappedAddress = wrappedToken?.address || '';
         
@@ -223,7 +232,7 @@ export default function RemoveLiquidity() {
       const factory = new Contract(contracts.factory, FACTORY_ABI, provider);
       
       // Get wrapped token for native conversion (chain-specific)
-      const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+      const wrappedSymbol = getWrappedTokenSymbol(chainId);
       const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
       const wusdcAddress = wrappedToken?.address;
 
@@ -322,7 +331,7 @@ export default function RemoveLiquidity() {
       const isTokenBNative = tokenB.address === "0x0000000000000000000000000000000000000000";
 
       // Get wrapped token address and convert native to wrapped for router calls (chain-specific)
-      const wrappedSymbol = chainId === 2201 ? 'wUSDT' : 'wUSDC';
+      const wrappedSymbol = getWrappedTokenSymbol(chainId);
       const wrappedToken = tokens.find(t => t.symbol === wrappedSymbol);
       const wrappedAddress = wrappedToken?.address;
       
