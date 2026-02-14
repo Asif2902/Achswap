@@ -12,13 +12,14 @@ import { getTokensByChainId, isNativeToken, getWrappedAddress } from "@/data/tok
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
-import { priceToSqrtPriceX96, sqrtPriceX96ToPrice, priceToTick, tickToPrice, getNearestUsableTick, getTickSpacing, sortTokens, isPositionInRange } from "@/lib/v3-utils";
-import { AlertTriangle, Zap, ExternalLink, TrendingUp, TrendingDown, ArrowDownUp } from "lucide-react";
+import { priceToSqrtPriceX96, sqrtPriceX96ToPrice, priceToTick, tickToPrice, getNearestUsableTick, getTickSpacing, sortTokens, isPositionInRange, getFullRangeTicks } from "@/lib/v3-utils";
+import { AlertTriangle, Zap, ExternalLink, TrendingUp, TrendingDown, ArrowDownUp, Info, Calculator, Settings, BarChart3 } from "lucide-react";
 import { PriceRangeChart } from "./PriceRangeChart";
 
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
+  "function balanceOf(address owner) view returns (uint256)",
 ];
 
 const WRAPPED_TOKEN_ABI = [
@@ -50,10 +51,17 @@ export function AddLiquidityV3Advanced() {
   const [selectedFee, setSelectedFee] = useState<number>(V3_FEE_TIERS.MEDIUM);
   const [minPrice, setMinPrice] = useState("");
   const [maxPrice, setMaxPrice] = useState("");
+  const [minTick, setMinTick] = useState("");
+  const [maxTick, setMaxTick] = useState("");
   const [isAdding, setIsAdding] = useState(false);
   const [poolExists, setPoolExists] = useState(false);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
   const [currentTick, setCurrentTick] = useState<number | null>(null);
+  const [poolLiquidity, setPoolLiquidity] = useState<bigint>(0n);
+  const [slippage, setSlippage] = useState("2");
+  const [useTickMode, setUseTickMode] = useState(false);
+  const [balanceA, setBalanceA] = useState<bigint | null>(null);
+  const [balanceB, setBalanceB] = useState<bigint | null>(null);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -62,11 +70,11 @@ export function AddLiquidityV3Advanced() {
   const contracts = chainId ? getContractsForChain(chainId) : null;
 
   const feeOptions = [
-    { value: V3_FEE_TIERS.LOWEST, label: "0.01%" },
-    { value: V3_FEE_TIERS.LOW, label: "0.05%" },
-    { value: V3_FEE_TIERS.MEDIUM, label: "0.3%" },
-    { value: V3_FEE_TIERS.HIGH, label: "1%" },
-    { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%" },
+    { value: V3_FEE_TIERS.LOWEST, label: "0.01%", description: "Very stable pairs (stablecoins)" },
+    { value: V3_FEE_TIERS.LOW, label: "0.05%", description: "Stable pairs" },
+    { value: V3_FEE_TIERS.MEDIUM, label: "0.3%", description: "Most pairs (recommended)" },
+    { value: V3_FEE_TIERS.HIGH, label: "1%", description: "Exotic/volatile pairs" },
+    { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%", description: "Very exotic pairs" },
   ];
 
   // Load tokens
@@ -88,7 +96,6 @@ export function AddLiquidityV3Advanced() {
         throw new Error("Invalid token address format");
       }
 
-      // Check if token already exists
       const exists = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
       if (exists) {
         toast({
@@ -98,7 +105,6 @@ export function AddLiquidityV3Advanced() {
         return exists;
       }
 
-      // Use public RPC for token data
       const rpcUrl = 'https://rpc.testnet.arc.network';
       const provider = new BrowserProvider({
         request: async ({ method, params }: any) => {
@@ -202,6 +208,43 @@ export function AddLiquidityV3Advanced() {
     }
   }, [tokens, tokenA, tokenB]);
 
+  // Load balances
+  useEffect(() => {
+    const loadBalances = async () => {
+      if (!address || !window.ethereum || !tokenA || !tokenB) return;
+      
+      try {
+        const provider = new BrowserProvider(window.ethereum);
+        
+        // Load token A balance
+        const tokenAERC20 = getERC20Address(tokenA, chainId!);
+        if (isNativeToken(tokenA.address)) {
+          const bal = await provider.getBalance(address);
+          setBalanceA(bal);
+        } else {
+          const contract = new Contract(tokenAERC20, ERC20_ABI, provider);
+          const bal = await contract.balanceOf(address);
+          setBalanceA(bal);
+        }
+        
+        // Load token B balance
+        const tokenBERC20 = getERC20Address(tokenB, chainId!);
+        if (isNativeToken(tokenB.address)) {
+          const bal = await provider.getBalance(address);
+          setBalanceB(bal);
+        } else {
+          const contract = new Contract(tokenBERC20, ERC20_ABI, provider);
+          const bal = await contract.balanceOf(address);
+          setBalanceB(bal);
+        }
+      } catch (error) {
+        console.error("Error loading balances:", error);
+      }
+    };
+    
+    loadBalances();
+  }, [address, tokenA, tokenB, chainId]);
+
   // Check if either token needs wrapping
   const needsWrapA = tokenA ? isNativeToken(tokenA.address) : false;
   const needsWrapB = tokenB ? isNativeToken(tokenB.address) : false;
@@ -229,12 +272,14 @@ export function AddLiquidityV3Advanced() {
           const slot0 = await pool.slot0();
           const sqrtPriceX96 = slot0[0];
           const tick = slot0[1];
+          const liquidity = await pool.liquidity();
 
           // Use the utility function for consistent price calculation
           const adjustedPrice = sqrtPriceX96ToPrice(sqrtPriceX96, token0.decimals, token1.decimals);
 
           setCurrentPrice(adjustedPrice);
           setCurrentTick(Number(tick));
+          setPoolLiquidity(liquidity);
 
           // Set default range around current price if not set
           if (!minPrice && !maxPrice) {
@@ -242,11 +287,19 @@ export function AddLiquidityV3Advanced() {
             const upperPrice = (adjustedPrice * 1.2).toFixed(6);
             setMinPrice(lowerPrice);
             setMaxPrice(upperPrice);
+            
+            // Also set ticks
+            const tickSpacing = getTickSpacing(selectedFee);
+            const lowerTick = getNearestUsableTick(priceToTick(adjustedPrice * 0.8, token0.decimals, token1.decimals), tickSpacing);
+            const upperTick = getNearestUsableTick(priceToTick(adjustedPrice * 1.2, token0.decimals, token1.decimals), tickSpacing);
+            setMinTick(lowerTick.toString());
+            setMaxTick(upperTick.toString());
           }
         } else {
           setPoolExists(false);
           setCurrentPrice(null);
           setCurrentTick(null);
+          setPoolLiquidity(0n);
         }
       } catch (error) {
         console.error("Error checking pool:", error);
@@ -257,6 +310,30 @@ export function AddLiquidityV3Advanced() {
     checkPool();
   }, [tokenA, tokenB, selectedFee, contracts]);
 
+  // Sync price and tick inputs
+  useEffect(() => {
+    if (!tokenA || !tokenB || !chainId) return;
+    
+    const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
+    const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
+    const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
+    
+    if (useTickMode && minTick && maxTick) {
+      // Convert ticks to prices
+      const minP = tickToPrice(parseInt(minTick), token0.decimals, token1.decimals);
+      const maxP = tickToPrice(parseInt(maxTick), token1.decimals, token0.decimals);
+      setMinPrice(minP.toFixed(6));
+      setMaxPrice(maxP.toFixed(6));
+    } else if (!useTickMode && minPrice && maxPrice) {
+      // Convert prices to ticks
+      const tickSpacing = getTickSpacing(selectedFee);
+      const minT = getNearestUsableTick(priceToTick(parseFloat(minPrice), token0.decimals, token1.decimals), tickSpacing);
+      const maxT = getNearestUsableTick(priceToTick(parseFloat(maxPrice), token0.decimals, token1.decimals), tickSpacing);
+      setMinTick(minT.toString());
+      setMaxTick(maxT.toString());
+    }
+  }, [useTickMode, minTick, maxTick, minPrice, maxPrice, tokenA, tokenB, chainId, selectedFee]);
+
   // Auto-calculate amountB based on current pool price
   useEffect(() => {
     if (!currentPrice || !amountA || !tokenA || !tokenB || !chainId) return;
@@ -265,15 +342,11 @@ export function AddLiquidityV3Advanced() {
     if (isNaN(amountAFloat) || amountAFloat <= 0) return;
 
     try {
-      // Use ERC20 addresses for sorting (V3 uses wrapped tokens)
       const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
       const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
       const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
       const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
 
-      // For V3, the currentPrice is token1/token0
-      // If user inputs token0 amount, calculate token1: amount1 = amount0 * price
-      // If user inputs token1 amount, calculate token0: amount0 = amount1 / price
       const calculatedAmountB = isToken0A 
         ? amountAFloat * currentPrice 
         : amountAFloat / currentPrice;
@@ -284,13 +357,61 @@ export function AddLiquidityV3Advanced() {
     }
   }, [amountA, currentPrice, tokenA, tokenB, chainId]);
 
+  // Quick range presets
+  const applyRangePreset = (preset: 'full' | 'wide' | 'narrow' | 'current') => {
+    if (!currentPrice || !tokenA || !tokenB || !chainId) return;
+    
+    const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
+    const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
+    const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
+    const tickSpacing = getTickSpacing(selectedFee);
+    
+    if (preset === 'full') {
+      const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
+      setMinTick(tickLower.toString());
+      setMaxTick(tickUpper.toString());
+      const minP = tickToPrice(tickLower, token0.decimals, token1.decimals);
+      const maxP = tickToPrice(tickUpper, token0.decimals, token1.decimals);
+      setMinPrice(minP.toFixed(10));
+      setMaxPrice(maxP.toFixed(10));
+    } else if (preset === 'wide') {
+      const lowerPrice = currentPrice * 0.5;
+      const upperPrice = currentPrice * 2;
+      setMinPrice(lowerPrice.toFixed(6));
+      setMaxPrice(upperPrice.toFixed(6));
+      const minT = getNearestUsableTick(priceToTick(lowerPrice, token0.decimals, token1.decimals), tickSpacing);
+      const maxT = getNearestUsableTick(priceToTick(upperPrice, token0.decimals, token1.decimals), tickSpacing);
+      setMinTick(minT.toString());
+      setMaxTick(maxT.toString());
+    } else if (preset === 'narrow') {
+      const lowerPrice = currentPrice * 0.9;
+      const upperPrice = currentPrice * 1.1;
+      setMinPrice(lowerPrice.toFixed(6));
+      setMaxPrice(upperPrice.toFixed(6));
+      const minT = getNearestUsableTick(priceToTick(lowerPrice, token0.decimals, token1.decimals), tickSpacing);
+      const maxT = getNearestUsableTick(priceToTick(upperPrice, token0.decimals, token1.decimals), tickSpacing);
+      setMinTick(minT.toString());
+      setMaxTick(maxT.toString());
+    } else if (preset === 'current') {
+      // Single-sided at current price
+      const tickLower = getNearestUsableTick(currentTick || 0, tickSpacing);
+      const tickUpper = tickLower + tickSpacing;
+      setMinTick(tickLower.toString());
+      setMaxTick(tickUpper.toString());
+      const minP = tickToPrice(tickLower, token0.decimals, token1.decimals);
+      const maxP = tickToPrice(tickUpper, token0.decimals, token1.decimals);
+      setMinPrice(minP.toFixed(6));
+      setMaxPrice(maxP.toFixed(6));
+    }
+  };
+
   const handleAddLiquidity = async () => {
-    if (!tokenA || !tokenB || !amountA || !amountB || !minPrice || !maxPrice || !address || !contracts || !window.ethereum || !chainId) return;
+    if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum || !chainId) return;
 
     const minPriceFloat = parseFloat(minPrice);
     const maxPriceFloat = parseFloat(maxPrice);
 
-    if (minPriceFloat <= 0 || maxPriceFloat <= 0 || minPriceFloat >= maxPriceFloat) {
+    if (!useTickMode && (minPriceFloat <= 0 || maxPriceFloat <= 0 || minPriceFloat >= maxPriceFloat)) {
       toast({
         title: "Invalid price range",
         description: "Min price must be less than max price and both must be positive",
@@ -360,14 +481,22 @@ export function AddLiquidityV3Advanced() {
 
       // Convert prices to ticks
       const tickSpacing = getTickSpacing(selectedFee);
-      const tickLower = getNearestUsableTick(
-        priceToTick(minPriceFloat, token0.decimals, token1.decimals),
-        tickSpacing
-      );
-      const tickUpper = getNearestUsableTick(
-        priceToTick(maxPriceFloat, token0.decimals, token1.decimals),
-        tickSpacing
-      );
+      let tickLower: number;
+      let tickUpper: number;
+      
+      if (useTickMode) {
+        tickLower = getNearestUsableTick(parseInt(minTick), tickSpacing);
+        tickUpper = getNearestUsableTick(parseInt(maxTick), tickSpacing);
+      } else {
+        tickLower = getNearestUsableTick(
+          priceToTick(minPriceFloat, token0.decimals, token1.decimals),
+          tickSpacing
+        );
+        tickUpper = getNearestUsableTick(
+          priceToTick(maxPriceFloat, token0.decimals, token1.decimals),
+          tickSpacing
+        );
+      }
 
       // Create pool if it doesn't exist
       if (!poolExists) {
@@ -409,9 +538,11 @@ export function AddLiquidityV3Advanced() {
         await approveTx.wait();
       }
 
-      // Mint position with 2% slippage
-      const amount0Min = (amount0Desired * 98n) / 100n;
-      const amount1Min = (amount1Desired * 98n) / 100n;
+      // Calculate slippage-protected minimums
+      const slippagePercent = parseFloat(slippage) || 2;
+      const slippageMultiplier = BigInt(Math.floor((100 - slippagePercent) * 100));
+      const amount0Min = (amount0Desired * slippageMultiplier) / 10000n;
+      const amount1Min = (amount1Desired * slippageMultiplier) / 10000n;
       const deadline = Math.floor(Date.now() / 1000) + 1200;
 
       toast({
@@ -470,14 +601,10 @@ export function AddLiquidityV3Advanced() {
   };
 
   // Check if position is in range
-  const isInRange = currentTick !== null && minPrice && maxPrice && tokenA && tokenB && chainId
+  const isInRange = currentTick !== null && minTick && maxTick && tokenA && tokenB && chainId
     ? (() => {
-        // Use ERC20 addresses for sorting
-        const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
-        const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
-        const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
-        const tickLower = priceToTick(parseFloat(minPrice), token0.decimals, token1.decimals);
-        const tickUpper = priceToTick(parseFloat(maxPrice), token0.decimals, token1.decimals);
+        const tickLower = parseInt(minTick);
+        const tickUpper = parseInt(maxTick);
         return isPositionInRange(currentTick, tickLower, tickUpper);
       })()
     : null;
@@ -490,7 +617,7 @@ export function AddLiquidityV3Advanced() {
         <div className="space-y-1">
           <h3 className="font-semibold text-orange-400 text-sm">Advanced Mode - Full Control</h3>
           <p className="text-xs text-slate-300">
-            You have full control over price ranges and ticks. Incorrect settings may result in capital inefficiency or losses. Use with caution.
+            You have full control over price ranges, ticks, and slippage. Incorrect settings may result in capital inefficiency or losses.
           </p>
         </div>
       </div>
@@ -499,7 +626,14 @@ export function AddLiquidityV3Advanced() {
       <Card className="bg-slate-900 border-slate-700">
         <CardContent className="p-6 space-y-4">
           <div className="space-y-2">
-            <Label className="text-sm text-slate-400">Token A</Label>
+            <div className="flex items-center justify-between">
+              <Label className="text-sm text-slate-400">Token A</Label>
+              {balanceA && tokenA && (
+                <span className="text-xs text-slate-500">
+                  Balance: {formatAmount(balanceA, tokenA.decimals)}
+                </span>
+              )}
+            </div>
             <div className="flex gap-2">
               <Input
                 type="number"
@@ -522,7 +656,14 @@ export function AddLiquidityV3Advanced() {
           </div>
 
           <div className="space-y-2">
-            <Label className="text-sm text-slate-400">Token B</Label>
+            <div className="flex items-center justify-between">
+              <Label className="text-sm text-slate-400">Token B</Label>
+              {balanceB && tokenB && (
+                <span className="text-xs text-slate-500">
+                  Balance: {formatAmount(balanceB, tokenB.decimals)}
+                </span>
+              )}
+            </div>
             <div className="flex gap-2">
               <Input
                 type="number"
@@ -549,7 +690,10 @@ export function AddLiquidityV3Advanced() {
       {/* Fee Tier Selection */}
       <Card className="bg-slate-900 border-slate-700">
         <CardContent className="p-6 space-y-3">
-          <Label className="text-sm text-slate-400">Fee Tier</Label>
+          <div className="flex items-center gap-2">
+            <Label className="text-sm text-slate-400">Fee Tier</Label>
+            <Info className="h-4 w-4 text-slate-500" />
+          </div>
           <div className="flex gap-2 flex-wrap">
             {feeOptions.map((option) => (
               <Button
@@ -557,55 +701,129 @@ export function AddLiquidityV3Advanced() {
                 variant={selectedFee === option.value ? "default" : "outline"}
                 onClick={() => setSelectedFee(option.value)}
                 className="flex-1 min-w-[80px]"
+                title={option.description}
               >
                 {option.label}
               </Button>
             ))}
           </div>
+          {poolExists && (
+            <div className="flex items-center gap-2 text-xs text-slate-400">
+              <BarChart3 className="h-4 w-4" />
+              <span>Pool Liquidity: {formatAmount(poolLiquidity, 18)}</span>
+            </div>
+          )}
         </CardContent>
       </Card>
 
-      {/* Price Range */}
+      {/* Price Range Mode Toggle */}
       <Card className="bg-slate-900 border-slate-700">
         <CardContent className="p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <Label className="text-sm text-slate-400">Input Mode</Label>
+            <div className="flex gap-2">
+              <Button
+                variant={!useTickMode ? "default" : "outline"}
+                size="sm"
+                onClick={() => setUseTickMode(false)}
+              >
+                Price
+              </Button>
+              <Button
+                variant={useTickMode ? "default" : "outline"}
+                size="sm"
+                onClick={() => setUseTickMode(true)}
+              >
+                Ticks
+              </Button>
+            </div>
+          </div>
+
+          {/* Quick Range presets */}
+          {poolExists && currentPrice && (
+            <div className="space-y-2">
+              <Label className="text-xs text-slate-500">Quick Range Presets</Label>
+              <div className="flex gap-2 flex-wrap">
+                <Button variant="outline" size="sm" onClick={() => applyRangePreset('full')}>
+                  Full Range
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => applyRangePreset('wide')}>
+                  Wide (0.5x - 2x)
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => applyRangePreset('narrow')}>
+                  Narrow (±10%)
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => applyRangePreset('current')}>
+                  At Current
+                </Button>
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center justify-between">
             <Label className="text-sm text-slate-400">Price Range</Label>
             {poolExists && currentPrice && (
               <span className="text-xs text-slate-400">
-                Current: {currentPrice.toFixed(6)}
+                Current: {currentPrice.toFixed(6)} ({currentTick})
               </span>
             )}
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label className="text-xs text-slate-500">Min Price</Label>
-              <div className="relative">
-                <Input
-                  type="number"
-                  placeholder="0.00"
-                  value={minPrice}
-                  onChange={(e) => setMinPrice(e.target.value)}
-                  className="bg-slate-800 border-slate-600"
-                />
-                <TrendingDown className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+          {!useTickMode ? (
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label className="text-xs text-slate-500">Min Price ({tokenB?.symbol || 'B'}/{tokenA?.symbol || 'A'})</Label>
+                <div className="relative">
+                  <Input
+                    type="number"
+                    placeholder="0.00"
+                    value={minPrice}
+                    onChange={(e) => setMinPrice(e.target.value)}
+                    className="bg-slate-800 border-slate-600"
+                  />
+                  <TrendingDown className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+                </div>
               </div>
-            </div>
 
-            <div className="space-y-2">
-              <Label className="text-xs text-slate-500">Max Price</Label>
-              <div className="relative">
-                <Input
-                  type="number"
-                  placeholder="0.00"
-                  value={maxPrice}
-                  onChange={(e) => setMaxPrice(e.target.value)}
-                  className="bg-slate-800 border-slate-600"
-                />
-                <TrendingUp className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+              <div className="space-y-2">
+                <Label className="text-xs text-slate-500">Max Price ({tokenB?.symbol || 'B'}/{tokenA?.symbol || 'A'})</Label>
+                <div className="relative">
+                  <Input
+                    type="number"
+                    placeholder="0.00"
+                    value={maxPrice}
+                    onChange={(e) => setMaxPrice(e.target.value)}
+                    className="bg-slate-800 border-slate-600"
+                  />
+                  <TrendingUp className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label className="text-xs text-slate-500">Tick Lower</Label>
+                <Input
+                  type="number"
+                  placeholder="-887272"
+                  value={minTick}
+                  onChange={(e) => setMinTick(e.target.value)}
+                  className="bg-slate-800 border-slate-600"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label className="text-xs text-slate-500">Tick Upper</Label>
+                <Input
+                  type="number"
+                  placeholder="887272"
+                  value={maxTick}
+                  onChange={(e) => setMaxTick(e.target.value)}
+                  className="bg-slate-800 border-slate-600"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Price Range Chart */}
           {tokenA && tokenB && minPrice && maxPrice && parseFloat(minPrice) > 0 && parseFloat(maxPrice) > 0 && (
@@ -640,6 +858,37 @@ export function AddLiquidityV3Advanced() {
               </div>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Slippage Settings */}
+      <Card className="bg-slate-900 border-slate-700">
+        <CardContent className="p-6 space-y-3">
+          <div className="flex items-center gap-2">
+            <Settings className="h-4 w-4 text-slate-400" />
+            <Label className="text-sm text-slate-400">Slippage Tolerance</Label>
+          </div>
+          <div className="flex gap-2">
+            {['0.5', '1', '2', '5'].map((s) => (
+              <Button
+                key={s}
+                variant={slippage === s ? "default" : "outline"}
+                size="sm"
+                onClick={() => setSlippage(s)}
+              >
+                {s}%
+              </Button>
+            ))}
+            <div className="flex items-center gap-1">
+              <Input
+                type="number"
+                value={slippage}
+                onChange={(e) => setSlippage(e.target.value)}
+                className="w-20 bg-slate-800 border-slate-600"
+              />
+              <span className="text-sm text-slate-400">%</span>
+            </div>
+          </div>
         </CardContent>
       </Card>
 
