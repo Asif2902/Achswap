@@ -347,17 +347,21 @@ export function AddLiquidityV3Basic() {
       const amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
       const amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
 
-      // Calculate price from amounts for pool initialization
-      const price = getPriceFromAmounts(amount0Desired, amount1Desired, token0.decimals, token1.decimals);
-      const sqrtPriceX96 = priceToSqrtPriceX96(price, token0.decimals, token1.decimals);
+      // Check if pool exists
+      const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
+      const poolAddress = await factory.getPool(token0.address, token1.address, selectedFee);
+      const poolExists = poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000";
 
-      // ALWAYS try to create/initialize pool first - this is safe even if pool exists
-      toast({
-        title: "Ensuring pool exists...",
-        description: "Creating or verifying V3 pool",
-      });
+      if (!poolExists) {
+        // Pool doesn't exist - need to create and initialize
+        const price = getPriceFromAmounts(amount0Desired, amount1Desired, token0.decimals, token1.decimals);
+        const sqrtPriceX96 = priceToSqrtPriceX96(price, token0.decimals, token1.decimals);
 
-      try {
+        toast({
+          title: "Creating V3 pool...",
+          description: "Initializing new pool with current price",
+        });
+
         const createTx = await positionManager.createAndInitializePoolIfNecessary(
           token0.address,
           token1.address,
@@ -365,9 +369,6 @@ export function AddLiquidityV3Basic() {
           sqrtPriceX96
         );
         await createTx.wait();
-      } catch (poolError: any) {
-        // Pool might already exist with different price - that's OK
-        console.log("Pool creation note:", poolError.message);
       }
 
       // Get ticks - use full range for maximum safety in Basic mode
