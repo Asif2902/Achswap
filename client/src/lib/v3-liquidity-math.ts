@@ -124,6 +124,52 @@ export function getLiquidityForAmounts(
 }
 
 /**
+ * Convert V3 liquidity to actual token amounts
+ * Uses Uniswap V3's formula to calculate token amounts from liquidity
+ * 
+ * @param liquidity - The raw liquidity value from V3 position
+ * @param currentSqrtPriceX96 - Current pool sqrt price
+ * @param tickLower - Lower tick of the position
+ * @param tickUpper - Upper tick of the position
+ * @returns The actual token amounts (amount0, amount1)
+ */
+export function getTokensFromLiquidity(
+  liquidity: bigint,
+  currentSqrtPriceX96: bigint,
+  tickLower: number,
+  tickUpper: number
+): { amount0: bigint; amount1: bigint } {
+  // Calculate sqrt prices for tick bounds
+  const sqrtPriceLowerX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickLower) * Number(Q96)));
+  const sqrtPriceUpperX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickUpper) * Number(Q96)));
+  
+  let amount0: bigint;
+  let amount1: bigint;
+  
+  if (currentSqrtPriceX96 <= sqrtPriceLowerX96) {
+    // Price is below range - all token0
+    // amount0 = liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96) * Q96 / (sqrtPriceLowerX96 * sqrtPriceUpperX96)
+    amount0 = (liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96) * Q96) / 
+              (sqrtPriceLowerX96 * sqrtPriceUpperX96);
+    amount1 = 0n;
+  } else if (currentSqrtPriceX96 >= sqrtPriceUpperX96) {
+    // Price is above range - all token1
+    // amount1 = liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96) / Q96
+    amount0 = 0n;
+    amount1 = (liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96)) / Q96;
+  } else {
+    // Price is in range - both tokens
+    // amount0 = liquidity * (sqrtPriceUpperX96 - currentSqrtPriceX96) / (currentSqrtPriceX96 * sqrtPriceUpperX96)
+    // amount1 = liquidity * (currentSqrtPriceX96 - sqrtPriceLowerX96) / Q96
+    amount0 = (liquidity * (sqrtPriceUpperX96 - currentSqrtPriceX96)) / 
+              (currentSqrtPriceX96 * sqrtPriceUpperX96);
+    amount1 = (liquidity * (currentSqrtPriceX96 - sqrtPriceLowerX96)) / Q96;
+  }
+  
+  return { amount0, amount1 };
+}
+
+/**
  * Simple helper to calculate amount1 from amount0 based on current price
  * For UI display purposes
  */

@@ -5,8 +5,9 @@ import { useAccount, useChainId } from "wagmi";
 import { useToast } from "@/hooks/use-toast";
 import { Contract, BrowserProvider } from "ethers";
 import { getContractsForChain } from "@/lib/contracts";
-import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_POOL_ABI, FEE_TIER_LABELS } from "@/lib/abis/v3";
+import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_POOL_ABI, V3_FACTORY_ABI, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { formatAmount } from "@/lib/decimal-utils";
+import { getTokensFromLiquidity } from "@/lib/v3-liquidity-math";
 import { ExternalLink, Trash2, Coins, RefreshCw, DollarSign } from "lucide-react";
 
 const ERC20_ABI = [
@@ -28,6 +29,9 @@ interface V3Position {
   tickUpper: number;
   tokensOwed0: bigint;
   tokensOwed1: bigint;
+  // Calculated actual token amounts from liquidity
+  amount0: bigint;
+  amount1: bigint;
 }
 
 export function RemoveLiquidityV3() {
@@ -67,6 +71,10 @@ export function RemoveLiquidityV3() {
           // position returns: nonce, operator, token0, token1, fee, tickLower, tickUpper, liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128, tokensOwed0, tokensOwed1
           const token0Address = position[2];
           const token1Address = position[3];
+          const fee = Number(position[4]);
+          const tickLower = Number(position[5]);
+          const tickUpper = Number(position[6]);
+          const liquidity = position[7];
           const tokensOwed0 = position[10];
           const tokensOwed1 = position[11];
 
@@ -81,6 +89,34 @@ export function RemoveLiquidityV3() {
             token1Contract.decimals(),
           ]);
 
+          // Get pool address and current price
+          let amount0 = 0n;
+          let amount1 = 0n;
+
+          try {
+            const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
+            const poolAddress = await factory.getPool(token0Address, token1Address, fee);
+
+            if (poolAddress && poolAddress !== '0x0000000000000000000000000000000000000000') {
+              const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
+              const slot0 = await pool.slot0();
+              const currentSqrtPriceX96 = slot0[0];
+
+              // Calculate actual token amounts from liquidity using Uniswap V3 math
+              const tokenAmounts = getTokensFromLiquidity(
+                liquidity,
+                currentSqrtPriceX96,
+                tickLower,
+                tickUpper
+              );
+              amount0 = tokenAmounts.amount0;
+              amount1 = tokenAmounts.amount1;
+            }
+          } catch (poolError) {
+            console.error("Error fetching pool data:", poolError);
+            // If we can't get pool data, use 0 for amounts
+          }
+
           userPositions.push({
             tokenId,
             token0Address,
@@ -89,12 +125,14 @@ export function RemoveLiquidityV3() {
             token1Address,
             token1Symbol,
             token1Decimals: Number(token1Decimals),
-            fee: Number(position[4]),
-            liquidity: position[7],
-            tickLower: Number(position[5]),
-            tickUpper: Number(position[6]),
+            fee,
+            liquidity,
+            tickLower,
+            tickUpper,
             tokensOwed0,
             tokensOwed1,
+            amount0,
+            amount1,
           });
         } catch (error) {
           console.error(`Error loading position ${i}:`, error);
@@ -413,6 +451,30 @@ export function RemoveLiquidityV3() {
                       </div>
                     </div>
                   </div>
+                  
+                  {/* Liquidity Display - Actual token amounts from V3 math */}
+                  {(position.amount0 > 0n || position.amount1 > 0n) && (
+                    <div className="mt-2 p-2 bg-slate-800/50 rounded-md">
+                      <div className="flex items-center gap-2 text-xs">
+                        <Coins className="h-3 w-3 text-purple-400" />
+                        <span className="text-slate-400">Liquidity Value:</span>
+                      </div>
+                      <div className="flex gap-4 mt-1">
+                        <div className="text-sm">
+                          <span className="text-purple-400 font-medium">
+                            {formatFeeAmount(position.amount0, position.token0Decimals)}
+                          </span>
+                          <span className="text-slate-500 ml-1">{position.token0Symbol}</span>
+                        </div>
+                        <div className="text-sm">
+                          <span className="text-purple-400 font-medium">
+                            {formatFeeAmount(position.amount1, position.token1Decimals)}
+                          </span>
+                          <span className="text-slate-500 ml-1">{position.token1Symbol}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
                 
                 <div className="text-right">
@@ -478,6 +540,11 @@ export function RemoveLiquidityV3() {
             className="w-full h-12 text-base font-semibold"
           >
             {isRemoving ? "Removing..." : "Remove V3 Liquidity"}
+            {selectedPosition.amount0 > 0n || selectedPosition.amount1 > 0n ? (
+              <span className="ml-2 text-xs">
+                ({formatFeeAmount(selectedPosition.amount0, selectedPosition.token0Decimals)} {selectedPosition.token0Symbol} + {formatFeeAmount(selectedPosition.amount1, selectedPosition.token1Decimals)} {selectedPosition.token1Symbol})
+              </span>
+            ) : null}
           </Button>
         </div>
       )}
