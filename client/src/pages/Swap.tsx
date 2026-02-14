@@ -639,7 +639,7 @@ export default function Swap() {
             recipient: recipient,
             amountIn: amountIn,
             amountOutMinimum: minAmountOut,
-            sqrtPriceLimitX96: 0,
+            sqrtPriceLimitX96: 0n,
           };
           
           const gasEstimate = await swapRouter.exactInputSingle.estimateGas(params);

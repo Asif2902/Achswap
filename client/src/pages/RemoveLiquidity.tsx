@@ -20,7 +20,7 @@ export default function RemoveLiquidity() {
           <Tabs defaultValue="v2" className="w-full">
             <TabsList className="grid w-full grid-cols-2 mb-4 sm:mb-6 h-9 sm:h-10">
               <TabsTrigger value="v2" className="text-xs sm:text-sm">V2</TabsTrigger>
-              <TabsTrigger value="v3" className="text-xs sm:text-sm">V3</TabsTrigger>
+              <TabsTrigger value="v3" className="text-xs sm:text-sm">V3 / Collect Fees</TabsTrigger>
             </TabsList>
 
             <TabsContent value="v2">

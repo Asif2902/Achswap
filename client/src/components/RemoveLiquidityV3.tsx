@@ -8,7 +8,7 @@ import { Contract, BrowserProvider } from "ethers";
 import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_POOL_ABI, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { formatAmount } from "@/lib/decimal-utils";
-import { ExternalLink, Trash2 } from "lucide-react";
+import { ExternalLink, Trash2, Coins, RefreshCw, DollarSign } from "lucide-react";
 
 const ERC20_ABI = [
   "function symbol() view returns (string)",
@@ -17,12 +17,18 @@ const ERC20_ABI = [
 
 interface V3Position {
   tokenId: bigint;
+  token0Address: string;
   token0Symbol: string;
+  token0Decimals: number;
+  token1Address: string;
   token1Symbol: string;
+  token1Decimals: number;
   fee: number;
   liquidity: bigint;
   tickLower: number;
   tickUpper: number;
+  tokensOwed0: bigint;
+  tokensOwed1: bigint;
 }
 
 export function RemoveLiquidityV3() {
@@ -30,6 +36,8 @@ export function RemoveLiquidityV3() {
   const [selectedPosition, setSelectedPosition] = useState<V3Position | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
+  const [isCollecting, setIsCollecting] = useState(false);
+  const [isRefreshingFees, setIsRefreshingFees] = useState(false);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -37,7 +45,7 @@ export function RemoveLiquidityV3() {
 
   const contracts = chainId ? getContractsForChain(chainId) : null;
 
-  // Load user's V3 positions
+  // Load user's V3 positions with fee information
   const loadPositions = async () => {
     if (!address || !contracts || !window.ethereum) return;
 
@@ -58,23 +66,37 @@ export function RemoveLiquidityV3() {
           const tokenId = await positionManager.tokenOfOwnerByIndex(address, i);
           const position = await positionManager.positions(tokenId);
 
-          // Get token symbols
-          const token0Contract = new Contract(position[2], ERC20_ABI, provider);
-          const token1Contract = new Contract(position[3], ERC20_ABI, provider);
+          // position returns: nonce, operator, token0, token1, fee, tickLower, tickUpper, liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128, tokensOwed0, tokensOwed1
+          const token0Address = position[2];
+          const token1Address = position[3];
+          const tokensOwed0 = position[10];
+          const tokensOwed1 = position[11];
 
-          const [token0Symbol, token1Symbol] = await Promise.all([
+          // Get token symbols and decimals
+          const token0Contract = new Contract(token0Address, ERC20_ABI, provider);
+          const token1Contract = new Contract(token1Address, ERC20_ABI, provider);
+
+          const [token0Symbol, token0Decimals, token1Symbol, token1Decimals] = await Promise.all([
             token0Contract.symbol(),
+            token0Contract.decimals(),
             token1Contract.symbol(),
+            token1Contract.decimals(),
           ]);
 
           userPositions.push({
             tokenId,
+            token0Address,
             token0Symbol,
+            token0Decimals: Number(token0Decimals),
+            token1Address,
             token1Symbol,
+            token1Decimals: Number(token1Decimals),
             fee: Number(position[4]),
             liquidity: position[7],
             tickLower: Number(position[5]),
             tickUpper: Number(position[6]),
+            tokensOwed0,
+            tokensOwed1,
           });
         } catch (error) {
           console.error(`Error loading position ${i}:`, error);
@@ -99,6 +121,134 @@ export function RemoveLiquidityV3() {
       });
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Refresh fees for a specific position (calls collect with 0 to update fees)
+  const refreshFees = async (position: V3Position) => {
+    if (!address || !contracts || !window.ethereum) return;
+
+    setIsRefreshingFees(true);
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const positionManager = new Contract(
+        contracts.v3.nonfungiblePositionManager,
+        NONFUNGIBLE_POSITION_MANAGER_ABI,
+        signer
+      );
+
+      // Call collect with 0 amounts to update the fees owed
+      // This doesn't transfer any tokens, just updates the accounting
+      const collectParams = {
+        tokenId: position.tokenId,
+        recipient: address,
+        amount0Max: 0n,
+        amount1Max: 0n,
+      };
+
+      await positionManager.collect(collectParams);
+
+      // Reload positions to get updated fees
+      await loadPositions();
+
+      toast({
+        title: "Fees refreshed",
+        description: "Fee amounts have been updated",
+      });
+    } catch (error: any) {
+      console.error("Error refreshing fees:", error);
+      toast({
+        title: "Failed to refresh fees",
+        description: error.reason || error.message || "Transaction failed",
+        variant: "destructive",
+      });
+    } finally {
+      setIsRefreshingFees(false);
+    }
+  };
+
+  // Collect fees without removing liquidity
+  const handleCollectFees = async () => {
+    if (!selectedPosition || !address || !contracts || !window.ethereum) return;
+
+    setIsCollecting(true);
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+
+      const positionManager = new Contract(
+        contracts.v3.nonfungiblePositionManager,
+        NONFUNGIBLE_POSITION_MANAGER_ABI,
+        signer
+      );
+
+      toast({
+        title: "Collecting fees...",
+        description: "Claiming your trading fees",
+      });
+
+      // Collect all available fees
+      const collectParams = {
+        tokenId: selectedPosition.tokenId,
+        recipient: address,
+        amount0Max: 2n ** 128n - 1n, // Max uint128
+        amount1Max: 2n ** 128n - 1n,
+      };
+
+      const collectTx = await positionManager.collect(collectParams);
+      const receipt = await collectTx.wait();
+
+      // Parse the Collect event to get amounts
+      let amount0Collected = 0n;
+      let amount1Collected = 0n;
+      
+      for (const log of receipt.logs) {
+        try {
+          const parsed = positionManager.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === "Collect") {
+            amount0Collected = parsed.args.amount0;
+            amount1Collected = parsed.args.amount1;
+          }
+        } catch {
+          // Not a Collect event
+        }
+      }
+
+      // Reload positions
+      await loadPositions();
+
+      const formatted0 = formatAmount(amount0Collected, selectedPosition.token0Decimals);
+      const formatted1 = formatAmount(amount1Collected, selectedPosition.token1Decimals);
+
+      toast({
+        title: "Fees collected!",
+        description: (
+          <div className="flex flex-col gap-1">
+            <span>Collected: {formatted0} {selectedPosition.token0Symbol} + {formatted1} {selectedPosition.token1Symbol}</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 w-fit"
+              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, '_blank')}
+            >
+              <ExternalLink className="h-3 w-3 mr-1" /> View Transaction
+            </Button>
+          </div>
+        ),
+      });
+    } catch (error: any) {
+      console.error("Collect fees error:", error);
+      toast({
+        title: "Failed to collect fees",
+        description: error.reason || error.message || "Transaction failed",
+        variant: "destructive",
+      });
+    } finally {
+      setIsCollecting(false);
     }
   };
 
@@ -141,10 +291,10 @@ export function RemoveLiquidityV3() {
 
       toast({
         title: "Collecting tokens...",
-        description: "Step 2: Collecting your tokens",
+        description: "Step 2: Collecting your tokens and fees",
       });
 
-      // Step 2: Collect tokens
+      // Step 2: Collect tokens + fees
       const collectParams = {
         tokenId: selectedPosition.tokenId,
         recipient: address,
@@ -193,6 +343,17 @@ export function RemoveLiquidityV3() {
     } finally {
       setIsRemoving(false);
     }
+  };
+
+  // Format fee amounts for display
+  const formatFeeAmount = (amount: bigint, decimals: number): string => {
+    if (amount === 0n) return "0";
+    return formatAmount(amount, decimals);
+  };
+
+  // Check if position has collectable fees
+  const hasFees = (position: V3Position): boolean => {
+    return position.tokensOwed0 > 0n || position.tokensOwed1 > 0n;
   };
 
   if (!isConnected) {
@@ -245,7 +406,7 @@ export function RemoveLiquidityV3() {
           >
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
-                <div>
+                <div className="flex-1">
                   <div className="font-semibold text-white">
                     {position.token0Symbol} / {position.token1Symbol}
                   </div>
@@ -253,7 +414,30 @@ export function RemoveLiquidityV3() {
                     Fee: {FEE_TIER_LABELS[position.fee as keyof typeof FEE_TIER_LABELS]} | 
                     Token ID: #{position.tokenId.toString()}
                   </div>
+                  
+                  {/* Fee Display */}
+                  <div className="mt-2 p-2 bg-slate-800/50 rounded-md">
+                    <div className="flex items-center gap-2 text-xs">
+                      <DollarSign className="h-3 w-3 text-green-400" />
+                      <span className="text-slate-400">Pending Fees:</span>
+                    </div>
+                    <div className="flex gap-4 mt-1">
+                      <div className="text-sm">
+                        <span className="text-green-400 font-medium">
+                          {formatFeeAmount(position.tokensOwed0, position.token0Decimals)}
+                        </span>
+                        <span className="text-slate-500 ml-1">{position.token0Symbol}</span>
+                      </div>
+                      <div className="text-sm">
+                        <span className="text-green-400 font-medium">
+                          {formatFeeAmount(position.tokensOwed1, position.token1Decimals)}
+                        </span>
+                        <span className="text-slate-500 ml-1">{position.token1Symbol}</span>
+                      </div>
+                    </div>
+                  </div>
                 </div>
+                
                 <div className="text-right">
                   <div className="text-sm font-medium text-purple-400">
                     V3 Position
@@ -261,6 +445,14 @@ export function RemoveLiquidityV3() {
                   <div className="text-xs text-slate-500">
                     Liquidity: {position.liquidity.toString().slice(0, 10)}...
                   </div>
+                  {hasFees(position) && (
+                    <div className="mt-1">
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400">
+                        <Coins className="h-3 w-3 mr-1" />
+                        Fees Ready
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             </CardContent>
@@ -268,16 +460,52 @@ export function RemoveLiquidityV3() {
         ))}
       </div>
 
-      {/* Remove Button */}
+      {/* Action Buttons */}
       {selectedPosition && (
-        <Button
-          onClick={handleRemove}
-          disabled={isRemoving}
-          variant="destructive"
-          className="w-full h-12 text-base font-semibold"
-        >
-          {isRemoving ? "Removing..." : "Remove V3 Liquidity"}
-        </Button>
+        <div className="space-y-3">
+          {/* Collect Fees Button */}
+          <Button
+            onClick={handleCollectFees}
+            disabled={isCollecting || (!hasFees(selectedPosition) && selectedPosition.liquidity > 0n)}
+            variant="outline"
+            className="w-full h-12 text-base font-semibold bg-green-600/20 border-green-500/50 hover:bg-green-600/30 text-green-400"
+          >
+            {isCollecting ? (
+              "Collecting..."
+            ) : (
+              <>
+                <Coins className="h-4 w-4 mr-2" />
+                Collect Fees
+                {hasFees(selectedPosition) && (
+                  <span className="ml-2 text-xs">
+                    ({formatFeeAmount(selectedPosition.tokensOwed0, selectedPosition.token0Decimals)} {selectedPosition.token0Symbol} + {formatFeeAmount(selectedPosition.tokensOwed1, selectedPosition.token1Decimals)} {selectedPosition.token1Symbol})
+                  </span>
+                )}
+              </>
+            )}
+          </Button>
+
+          {/* Refresh Fees Button */}
+          <Button
+            onClick={() => refreshFees(selectedPosition)}
+            disabled={isRefreshingFees}
+            variant="ghost"
+            className="w-full h-10 text-sm"
+          >
+            <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshingFees ? 'animate-spin' : ''}`} />
+            {isRefreshingFees ? "Updating..." : "Refresh Fee Amounts"}
+          </Button>
+
+          {/* Remove Liquidity Button */}
+          <Button
+            onClick={handleRemove}
+            disabled={isRemoving || selectedPosition.liquidity === 0n}
+            variant="destructive"
+            className="w-full h-12 text-base font-semibold"
+          >
+            {isRemoving ? "Removing..." : "Remove V3 Liquidity"}
+          </Button>
+        </div>
       )}
     </div>
   );

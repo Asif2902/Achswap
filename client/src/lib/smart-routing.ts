@@ -138,7 +138,7 @@ export async function getV3Quote(
           tokenOut: toTokenERC20,
           amountIn: amountIn,
           fee: fee,
-          sqrtPriceLimitX96: 0,
+          sqrtPriceLimitX96: 0n,
         };
         
         const result = await quoter.quoteExactInputSingle.staticCall(params);
@@ -371,7 +371,7 @@ async function calculateV3PriceImpact(
         tokenOut: tokenOutAddress,
         amountIn: halfAmountBigInt,
         fee: fee,
-        sqrtPriceLimitX96: 0,
+        sqrtPriceLimitX96: 0n,
       };
       
       const result = await quoter.quoteExactInputSingle.staticCall(params);

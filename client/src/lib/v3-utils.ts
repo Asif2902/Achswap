@@ -61,12 +61,20 @@ export function getPriceFromAmounts(
 
 /**
  * Get nearest usable tick for a given tick and tick spacing
+ * The returned tick must be divisible by tickSpacing and within valid range
  */
 export function getNearestUsableTick(tick: number, tickSpacing: number): number {
   const rounded = Math.round(tick / tickSpacing) * tickSpacing;
   
-  if (rounded < MIN_TICK) return MIN_TICK;
-  if (rounded > MAX_TICK) return MAX_TICK;
+  // Ensure the tick is within bounds AND divisible by tickSpacing
+  if (rounded < MIN_TICK) {
+    // Find the smallest valid tick that's >= MIN_TICK and divisible by tickSpacing
+    return Math.ceil(MIN_TICK / tickSpacing) * tickSpacing;
+  }
+  if (rounded > MAX_TICK) {
+    // Find the largest valid tick that's <= MAX_TICK and divisible by tickSpacing
+    return Math.floor(MAX_TICK / tickSpacing) * tickSpacing;
+  }
   
   return rounded;
 }
