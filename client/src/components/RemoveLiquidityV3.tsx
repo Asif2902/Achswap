@@ -289,45 +289,96 @@ export function RemoveLiquidityV3() {
 
       toast({
         title: "Removing liquidity...",
-        description: "Step 1: Decreasing liquidity",
+        description: "Decreasing liquidity, collecting tokens, and burning NFT in one transaction",
       });
 
-      // Step 1: Decrease liquidity
-      const decreaseParams = {
+      // Prepare the calls for multicall
+      // Order matters: decreaseLiquidity first, then collect, then burn
+      // This ensures we get the correct token amounts before collecting
+      
+      // decreaseLiquidity call
+      const decreaseData = positionManager.interface.encodeFunctionData("decreaseLiquidity", [{
         tokenId: selectedPosition.tokenId,
         liquidity: selectedPosition.liquidity,
         amount0Min: 0n,
         amount1Min: 0n,
         deadline: Math.floor(Date.now() / 1000) + 1200,
-      };
+      }]);
 
-      const decreaseTx = await positionManager.decreaseLiquidity(decreaseParams);
-      await decreaseTx.wait();
-
-      toast({
-        title: "Collecting tokens...",
-        description: "Step 2: Collecting your tokens and fees",
-      });
-
-      // Step 2: Collect tokens + fees
-      const collectParams = {
+      // collect call - collect both liquidity tokens and any pending fees
+      const collectData = positionManager.interface.encodeFunctionData("collect", [{
         tokenId: selectedPosition.tokenId,
         recipient: address,
         amount0Max: 2n ** 128n - 1n,
         amount1Max: 2n ** 128n - 1n,
-      };
+      }]);
 
-      const collectTx = await positionManager.collect(collectParams);
-      const receipt = await collectTx.wait();
+      // burn call - close and delete the position NFT
+      const burnData = positionManager.interface.encodeFunctionData("burn", [selectedPosition.tokenId]);
+
+      // Execute all calls in a single transaction using multicall
+      const multicallTx = await positionManager.multicall([
+        decreaseData,
+        collectData,
+        burnData
+      ]);
+
+      const receipt = await multicallTx.wait();
+
+      // Parse the receipts to get amounts
+      let amount0Collected = 0n;
+      let amount1Collected = 0n;
+
+      for (const log of receipt.logs) {
+        try {
+          const parsed = positionManager.interface.parseLog({
+            topics: log.topics as string[],
+            data: log.data,
+          });
+          if (parsed?.name === "Collect") {
+            amount0Collected = parsed.args.amount0;
+            amount1Collected = parsed.args.amount1;
+          }
+        } catch {
+          // Not a Collect event
+        }
+      }
+
+      const formatted0 = formatAmount(amount0Collected, selectedPosition.token0Decimals);
+      const formatted1 = formatAmount(amount1Collected, selectedPosition.token1Decimals);
 
       toast({
-        title: "Burning position...",
-        description: "Step 3: Burning NFT position",
+        title: "Liquidity removed successfully!",
+        description: (
+          <div className="flex flex-col gap-1">
+            <span>Removed: {formatted0} {selectedPosition.token0Symbol} + {formatted1} {selectedPosition.token1Symbol}</span>
+            <span className="text-xs text-slate-400">NFT position burned</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 w-fit"
+              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, '_blank')}
+            >
+              <ExternalLink className="h-3 w-3 mr-1" /> View Transaction
+            </Button>
+          </div>
+        ),
       });
 
-      // Step 3: Burn NFT
-      const burnTx = await positionManager.burn(selectedPosition.tokenId);
-      await burnTx.wait();
+      // Reload positions to reflect the removed position
+      await loadPositions();
+      setSelectedPosition(null);
+    } catch (error: any) {
+      console.error("Remove liquidity error:", error);
+      toast({
+        title: "Failed to remove liquidity",
+        description: error.reason || error.message || "Transaction failed",
+        variant: "destructive",
+      });
+    } finally {
+      setIsRemoving(false);
+    }
+  };
 
       setSelectedPosition(null);
       await loadPositions();
