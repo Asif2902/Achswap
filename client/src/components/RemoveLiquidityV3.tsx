@@ -95,12 +95,25 @@ export function RemoveLiquidityV3() {
 
           try {
             const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
-            const poolAddress = await factory.getPool(token0Address, token1Address, fee);
+            
+            // Sort tokens for pool lookup (Uniswap V3 requires token0 < token1 by address)
+            const [tokenA, tokenB] = token0Address.toLowerCase() < token1Address.toLowerCase()
+              ? [token0Address, token1Address]
+              : [token1Address, token0Address];
+            
+            const poolAddress = await factory.getPool(tokenA, tokenB, fee);
 
             if (poolAddress && poolAddress !== '0x0000000000000000000000000000000000000000') {
               const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
               const slot0 = await pool.slot0();
-              const currentSqrtPriceX96 = slot0[0];
+              let currentSqrtPriceX96 = slot0[0];
+              
+              // If pool not initialized (sqrtPriceX96 = 0), use a default or skip
+              if (currentSqrtPriceX96 === 0n) {
+                console.warn("Pool not initialized, using default sqrtPriceX96");
+                // Use a default price of 1:1 (sqrtPriceX96 = 2^96)
+                currentSqrtPriceX96 = 2n ** 96n;
+              }
 
               // Calculate actual token amounts from liquidity using Uniswap V3 math
               const tokenAmounts = getTokensFromLiquidity(
@@ -109,8 +122,18 @@ export function RemoveLiquidityV3() {
                 tickLower,
                 tickUpper
               );
-              amount0 = tokenAmounts.amount0;
-              amount1 = tokenAmounts.amount1;
+              
+              // The pool stores token0/token1 in sorted order, but position might have them reversed
+              // We need to swap amounts if token order is reversed
+              if (token0Address.toLowerCase() === tokenB.toLowerCase()) {
+                amount0 = tokenAmounts.amount1;
+                amount1 = tokenAmounts.amount0;
+              } else {
+                amount0 = tokenAmounts.amount0;
+                amount1 = tokenAmounts.amount1;
+              }
+            } else {
+              console.warn("Pool not found for token pair");
             }
           } catch (poolError) {
             console.error("Error fetching pool data:", poolError);
