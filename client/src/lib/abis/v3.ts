@@ -49,6 +49,10 @@ export const V3_MIGRATOR_ABI = [
   "function createAndInitializePoolIfNecessary(address token0, address token1, uint24 fee, uint160 sqrtPriceX96) external payable returns (address pool)",
 ];
 
+export const TICK_LENS_ABI = [
+  "function getPopulatedTicksInWord(address pool, int16 tickBitmapIndex) external view returns (tuple(int24 tick, int128 liquidityNet, uint128 liquidityGross)[] populatedTicks)",
+];
+
 // Common V3 Fee Tiers
 export const V3_FEE_TIERS = {
   LOWEST: 100,    // 0.01%

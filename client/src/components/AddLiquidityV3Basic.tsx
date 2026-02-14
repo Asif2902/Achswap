@@ -12,7 +12,8 @@ import { getTokensByChainId } from "@/data/tokens";
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
-import { priceToSqrtPriceX96, getWideRangeTicks, sortTokens, getPriceFromAmounts } from "@/lib/v3-utils";
+import { priceToSqrtPriceX96, getWideRangeTicks, sortTokens, getPriceFromAmounts, sqrtPriceX96ToPrice, getFullRangeTicks } from "@/lib/v3-utils";
+import { calculateAmountsForLiquidity } from "@/lib/v3-liquidity-math";
 import { AlertTriangle, Info, Shield, ExternalLink } from "lucide-react";
 
 const ERC20_ABI = [
@@ -33,6 +34,8 @@ export function AddLiquidityV3Basic() {
   const [poolExists, setPoolExists] = useState(false);
   const [isCheckingPool, setIsCheckingPool] = useState(false);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
+  const [currentSqrtPriceX96, setCurrentSqrtPriceX96] = useState<bigint | null>(null);
+  const [currentTick, setCurrentTick] = useState<number | null>(null);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -89,15 +92,20 @@ export function AddLiquidityV3Basic() {
           const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
           const slot0 = await pool.slot0();
           const sqrtPriceX96 = slot0[0];
+          const tick = Number(slot0[1]);
+
+          // Store raw values for calculations
+          setCurrentSqrtPriceX96(sqrtPriceX96);
+          setCurrentTick(tick);
 
           // Calculate human-readable price
-          const price = (Number(sqrtPriceX96) / (2 ** 96)) ** 2;
-          const adjustedPrice = price / (10 ** (token0.decimals - token1.decimals));
-          
-          setCurrentPrice(adjustedPrice);
+          const price = sqrtPriceX96ToPrice(sqrtPriceX96, token0.decimals, token1.decimals);
+          setCurrentPrice(price);
         } else {
           setPoolExists(false);
           setCurrentPrice(null);
+          setCurrentSqrtPriceX96(null);
+          setCurrentTick(null);
         }
       } catch (error) {
         console.error("Error checking pool:", error);
@@ -111,22 +119,53 @@ export function AddLiquidityV3Basic() {
     checkPool();
   }, [tokenA, tokenB, selectedFee, contracts]);
 
-  // Auto-calculate amountB based on current price
+  // Auto-calculate amountB based on current price and tick range
   useEffect(() => {
-    if (!currentPrice || !amountA || !tokenA || !tokenB) return;
+    if (!currentSqrtPriceX96 || !amountA || !tokenA || !tokenB || !currentTick) return;
 
     const amountAFloat = parseFloat(amountA);
     if (isNaN(amountAFloat) || amountAFloat <= 0) return;
 
-    const [token0] = sortTokens(tokenA, tokenB);
-    const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
+    try {
+      const [token0, token1] = sortTokens(tokenA, tokenB);
+      const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
 
-    const calculatedAmountB = isToken0A 
-      ? amountAFloat * currentPrice 
-      : amountAFloat / currentPrice;
+      // Get tick range for full range position
+      const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
-    setAmountB(calculatedAmountB.toFixed(6));
-  }, [amountA, currentPrice, tokenA, tokenB]);
+      // Parse amount to bigint
+      const inputAmount = parseAmount(amountA, isToken0A ? token0.decimals : token1.decimals);
+
+      // Calculate proper amounts based on V3 liquidity math
+      const { amount0, amount1 } = calculateAmountsForLiquidity(
+        inputAmount,
+        isToken0A,
+        currentSqrtPriceX96,
+        tickLower,
+        tickUpper,
+        token0.decimals,
+        token1.decimals
+      );
+
+      // Format the calculated amount for display
+      const calculatedAmountB = isToken0A 
+        ? formatAmount(amount1, token1.decimals)
+        : formatAmount(amount0, token0.decimals);
+
+      setAmountB(calculatedAmountB);
+    } catch (error) {
+      console.error("Error calculating amount:", error);
+      // Fallback to simple price calculation
+      if (currentPrice) {
+        const [token0] = sortTokens(tokenA, tokenB);
+        const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
+        const calculatedAmountB = isToken0A 
+          ? amountAFloat * currentPrice 
+          : amountAFloat / currentPrice;
+        setAmountB(calculatedAmountB.toFixed(6));
+      }
+    }
+  }, [amountA, currentSqrtPriceX96, currentTick, tokenA, tokenB, selectedFee, currentPrice]);
 
   const handleAddLiquidity = async () => {
     if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum) return;
@@ -173,7 +212,6 @@ export function AddLiquidityV3Basic() {
       }
 
       // Get ticks - use full range for maximum safety in Basic mode
-      const { getFullRangeTicks } = await import("@/lib/v3-utils");
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
       // Approve tokens
