@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import { useAccount, useChainId } from "wagmi";
 import { useToast } from "@/hooks/use-toast";
 import { Contract, BrowserProvider } from "ethers";
@@ -37,7 +36,6 @@ export function RemoveLiquidityV3() {
   const [isLoading, setIsLoading] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
   const [isCollecting, setIsCollecting] = useState(false);
-  const [isRefreshingFees, setIsRefreshingFees] = useState(false);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -121,50 +119,6 @@ export function RemoveLiquidityV3() {
       });
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  // Refresh fees for a specific position (calls collect with 0 to update fees)
-  const refreshFees = async (position: V3Position) => {
-    if (!address || !contracts || !window.ethereum) return;
-
-    setIsRefreshingFees(true);
-    try {
-      const provider = new BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-      const positionManager = new Contract(
-        contracts.v3.nonfungiblePositionManager,
-        NONFUNGIBLE_POSITION_MANAGER_ABI,
-        signer
-      );
-
-      // Call collect with 0 amounts to update the fees owed
-      // This doesn't transfer any tokens, just updates the accounting
-      const collectParams = {
-        tokenId: position.tokenId,
-        recipient: address,
-        amount0Max: 0n,
-        amount1Max: 0n,
-      };
-
-      await positionManager.collect(collectParams);
-
-      // Reload positions to get updated fees
-      await loadPositions();
-
-      toast({
-        title: "Fees refreshed",
-        description: "Fee amounts have been updated",
-      });
-    } catch (error: any) {
-      console.error("Error refreshing fees:", error);
-      toast({
-        title: "Failed to refresh fees",
-        description: error.reason || error.message || "Transaction failed",
-        variant: "destructive",
-      });
-    } finally {
-      setIsRefreshingFees(false);
     }
   };
 
@@ -351,6 +305,29 @@ export function RemoveLiquidityV3() {
     return formatAmount(amount, decimals);
   };
 
+  // Format liquidity for human-readable display
+  const formatLiquidity = (liquidity: bigint): string => {
+    const liquidityNum = Number(liquidity);
+    
+    if (liquidityNum === 0) return "0";
+    
+    // For very large numbers, use scientific notation or abbreviations
+    if (liquidityNum >= 1e15) {
+      return `${(liquidityNum / 1e15).toFixed(2)}Q`;
+    } else if (liquidityNum >= 1e12) {
+      return `${(liquidityNum / 1e12).toFixed(2)}T`;
+    } else if (liquidityNum >= 1e9) {
+      return `${(liquidityNum / 1e9).toFixed(2)}B`;
+    } else if (liquidityNum >= 1e6) {
+      return `${(liquidityNum / 1e6).toFixed(2)}M`;
+    } else if (liquidityNum >= 1e3) {
+      return `${(liquidityNum / 1e3).toFixed(2)}K`;
+    }
+    
+    // For smaller numbers, show with up to 4 decimal places
+    return liquidityNum.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  };
+
   // Check if position has collectable fees
   const hasFees = (position: V3Position): boolean => {
     return position.tokensOwed0 > 0n || position.tokensOwed1 > 0n;
@@ -442,8 +419,8 @@ export function RemoveLiquidityV3() {
                   <div className="text-sm font-medium text-purple-400">
                     V3 Position
                   </div>
-                  <div className="text-xs text-slate-500">
-                    Liquidity: {position.liquidity.toString().slice(0, 10)}...
+                  <div className="text-xs text-slate-400">
+                    Liquidity: {formatLiquidity(position.liquidity)}
                   </div>
                   {hasFees(position) && (
                     <div className="mt-1">
@@ -485,15 +462,15 @@ export function RemoveLiquidityV3() {
             )}
           </Button>
 
-          {/* Refresh Fees Button */}
+          {/* Refresh Button - Just reloads positions to get updated fees */}
           <Button
-            onClick={() => refreshFees(selectedPosition)}
-            disabled={isRefreshingFees}
+            onClick={loadPositions}
+            disabled={isLoading}
             variant="ghost"
             className="w-full h-10 text-sm"
           >
-            <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshingFees ? 'animate-spin' : ''}`} />
-            {isRefreshingFees ? "Updating..." : "Refresh Fee Amounts"}
+            <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? 'animate-spin' : ''}`} />
+            {isLoading ? "Refreshing..." : "Refresh Positions"}
           </Button>
 
           {/* Remove Liquidity Button */}
