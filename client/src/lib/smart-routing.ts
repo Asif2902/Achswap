@@ -105,14 +105,25 @@ export async function getV3Quote(
 ): Promise<QuoteResult | null> {
   try {
     // Check if quoter contract exists
-    const code = await provider.getCode(quoterAddress);
-    if (!code || code === "0x" || code === "0x0") {
-      console.warn("V3 Quoter contract not found at", quoterAddress);
-      return null;
+    try {
+      const code = await provider.getCode(quoterAddress);
+      if (!code || code === "0x" || code === "0x0") {
+        console.warn("V3 Quoter contract not found at", quoterAddress);
+        return null;
+      }
+    } catch (codeError) {
+      console.warn("Could not verify V3 Quoter contract:", codeError);
+      // Continue anyway - the contract call will fail if it doesn't exist
     }
 
     if (!wrappedTokenAddress) {
       console.warn("Wrapped token address required for V3 quotes");
+      return null;
+    }
+
+    // Don't try V3 for the same token swap
+    if (fromToken.address.toLowerCase() === toToken.address.toLowerCase()) {
+      console.warn("Cannot quote same token swap");
       return null;
     }
 
