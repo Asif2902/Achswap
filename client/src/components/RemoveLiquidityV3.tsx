@@ -419,9 +419,6 @@ export function RemoveLiquidityV3() {
                   <div className="text-sm font-medium text-purple-400">
                     V3 Position
                   </div>
-                  <div className="text-xs text-slate-400">
-                    Liquidity: {formatLiquidity(position.liquidity)}
-                  </div>
                   {hasFees(position) && (
                     <div className="mt-1">
                       <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400">
