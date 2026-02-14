@@ -380,37 +380,6 @@ export function RemoveLiquidityV3() {
     }
   };
 
-      setSelectedPosition(null);
-      await loadPositions();
-
-      toast({
-        title: "Liquidity removed!",
-        description: (
-          <div className="flex items-center gap-2">
-            <span>Successfully removed V3 liquidity</span>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 px-2"
-              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, '_blank')}
-            >
-              <ExternalLink className="h-3 w-3" />
-            </Button>
-          </div>
-        ),
-      });
-    } catch (error: any) {
-      console.error("Remove liquidity error:", error);
-      toast({
-        title: "Failed to remove liquidity",
-        description: error.reason || error.message || "Transaction failed",
-        variant: "destructive",
-      });
-    } finally {
-      setIsRemoving(false);
-    }
-  };
-
   // Format fee amounts for display
   const formatFeeAmount = (amount: bigint, decimals: number): string => {
     if (amount === 0n) return "0";
