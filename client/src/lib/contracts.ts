@@ -10,6 +10,7 @@ export interface V3Contracts {
   quoter02: string;
   migrator: string;
   positionDescriptor: string;
+  tickLens: string;
 }
 
 export interface ChainContracts {
@@ -25,12 +26,13 @@ export const contractsByChainId: Record<number, ChainContracts> = {
       router: "0xB92428D440c335546b69138F7fAF689F5ba8D436",
     },
     v3: {
-      factory: "0x462fa7f99218a8530D0506A63eB3fA9613d9D1b2",
-      swapRouter: "0xC88baEb6673d0baEAF7F255316AaDEa717AC7f76",
-      nonfungiblePositionManager: "0x8128818F047c33EDfb3c02ceaefcd4637B233a8C",
-      quoter02: "0xB61f0fB50Af89e201fA7821Da5fC88C11a471E81",
-      migrator: "0xd4fb625A887131d07dea1221338F94F9843ADc7c",
-      positionDescriptor: "0xd4eE8C842225845294B66e540E1DAc05D8177ae2",
+      factory: "0x0f65D7c4027076144a3E07796E69CCB55aa111A2",
+      swapRouter: "0x667aCD8167DC97E33f763a6d755aB8E1c6772900",
+      nonfungiblePositionManager: "0xC0aA4c3b53eaE5128a70f6B24A50bcE392A75db2",
+      quoter02: "0xd663bF28330f9072037E7894f5021A26FB9Cf53C",
+      migrator: "0xBFC03C5C2F74080D38fb68D268dcEede423722E1",
+      positionDescriptor: "0x6d413385B0383aaB3F69642c7d25dC90414f5f2c",
+      tickLens: "0xC3dA3Ef175Fa0C960a8066F63BC944c8E05af873",
     },
     explorer: "https://testnet.arcscan.app/tx/"
   },
