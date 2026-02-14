@@ -10,7 +10,7 @@ import { getTokensByChainId } from "@/data/tokens";
 import { formatAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { V3_MIGRATOR_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
-import { ArrowRight, AlertCircle, ExternalLink, RefreshCw } from "lucide-react";
+import { ArrowRight, AlertCircle, ExternalLink, RefreshCw, CheckCircle2 } from "lucide-react";
 
 const V2_PAIR_ABI = [
   "function token0() external view returns (address)",
@@ -39,6 +39,7 @@ interface V2Position {
   token0: Token;
   token1: Token;
   lpBalance: bigint;
+  totalSupply: bigint;
   reserve0: bigint;
   reserve1: bigint;
   sharePercent: number;
@@ -51,6 +52,7 @@ export function MigrateV2ToV3() {
   const [isMigrating, setIsMigrating] = useState(false);
   const [selectedFee, setSelectedFee] = useState<number>(V3_FEE_TIERS.MEDIUM);
   const [percentToMigrate, setPercentToMigrate] = useState(100);
+  const [migratorExists, setMigratorExists] = useState<boolean | null>(null);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -60,10 +62,26 @@ export function MigrateV2ToV3() {
   const tokens = chainId ? getTokensByChainId(chainId) : [];
 
   const feeOptions = [
-    { value: V3_FEE_TIERS.LOW, label: "0.05%" },
-    { value: V3_FEE_TIERS.MEDIUM, label: "0.3%" },
-    { value: V3_FEE_TIERS.HIGH, label: "1%" },
+    { value: V3_FEE_TIERS.LOWEST, label: "0.01%", description: "Very stable pairs" },
+    { value: V3_FEE_TIERS.LOW, label: "0.05%", description: "Stable pairs" },
+    { value: V3_FEE_TIERS.MEDIUM, label: "0.3%", description: "Most pairs" },
+    { value: V3_FEE_TIERS.HIGH, label: "1%", description: "Exotic pairs" },
   ];
+
+  // Check if migrator contract exists
+  useEffect(() => {
+    const checkMigrator = async () => {
+      if (!contracts || !window.ethereum) return;
+      try {
+        const provider = new BrowserProvider(window.ethereum);
+        const code = await provider.getCode(contracts.v3.migrator);
+        setMigratorExists(code !== "0x" && code !== "0x0");
+      } catch {
+        setMigratorExists(false);
+      }
+    };
+    checkMigrator();
+  }, [contracts]);
 
   // Load user's V2 positions
   const loadPositions = async () => {
@@ -136,6 +154,7 @@ export function MigrateV2ToV3() {
               token0,
               token1,
               lpBalance,
+              totalSupply,
               reserve0: reserves[0],
               reserve1: reserves[1],
               sharePercent,
@@ -174,7 +193,7 @@ export function MigrateV2ToV3() {
   }, [isConnected, address, chainId]);
 
   const handleMigrate = async () => {
-    if (!selectedPosition || !address || !contracts || !window.ethereum) return;
+    if (!selectedPosition || !address || !contracts || !window.ethereum || !migratorExists) return;
 
     setIsMigrating(true);
     try {
@@ -187,9 +206,9 @@ export function MigrateV2ToV3() {
       // Calculate liquidity to migrate
       const liquidityToMigrate = (selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n;
 
-      // Calculate expected amounts (with 2% slippage)
-      const amount0 = (selectedPosition.reserve0 * liquidityToMigrate) / selectedPosition.lpBalance;
-      const amount1 = (selectedPosition.reserve1 * liquidityToMigrate) / selectedPosition.lpBalance;
+      // Calculate expected amounts based on user's share of total supply (with 2% slippage)
+      const amount0 = (selectedPosition.reserve0 * liquidityToMigrate) / selectedPosition.totalSupply;
+      const amount1 = (selectedPosition.reserve1 * liquidityToMigrate) / selectedPosition.totalSupply;
       const amount0Min = (amount0 * 98n) / 100n;
       const amount1Min = (amount1 * 98n) / 100n;
 
@@ -307,6 +326,27 @@ export function MigrateV2ToV3() {
         </div>
       </div>
 
+      {/* Migrator Contract Status */}
+      {migratorExists === false && (
+        <div className="flex items-start gap-3 p-4 bg-red-500/10 border border-red-500/20 rounded-lg">
+          <AlertCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <h3 className="font-semibold text-red-400 text-sm">V3 Migrator Not Found</h3>
+            <p className="text-xs text-slate-300">
+              The V3 Migrator contract is not deployed at the configured address ({contracts?.v3.migrator}). 
+              Migration will not work until the contract is deployed.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {migratorExists === true && (
+        <div className="flex items-start gap-3 p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
+          <CheckCircle2 className="h-4 w-4 text-green-400 shrink-0 mt-0.5" />
+          <p className="text-xs text-green-400">V3 Migrator contract verified</p>
+        </div>
+      )}
+
       {/* V2 Positions List */}
       {isLoading ? (
         <Card className="bg-slate-900 border-slate-700">
@@ -362,8 +402,8 @@ export function MigrateV2ToV3() {
                         {position.token0.symbol} / {position.token1.symbol}
                       </div>
                       <div className="text-xs text-slate-400">
-                        {formatAmount(position.reserve0, position.token0.decimals)} {position.token0.symbol} +{" "}
-                        {formatAmount(position.reserve1, position.token1.decimals)} {position.token1.symbol}
+                        {formatAmount((position.reserve0 * position.lpBalance) / position.totalSupply, position.token0.decimals)} {position.token0.symbol} +{" "}
+                        {formatAmount((position.reserve1 * position.lpBalance) / position.totalSupply, position.token1.decimals)} {position.token1.symbol}
                       </div>
                     </div>
                   </div>
@@ -443,9 +483,32 @@ export function MigrateV2ToV3() {
                 </span>
               </div>
 
+              {/* Expected amounts */}
+              <div className="space-y-2 py-3 border-t border-slate-700">
+                <span className="text-slate-400 text-xs">Expected tokens to migrate ({percentToMigrate}%)</span>
+                <div className="flex justify-between text-sm">
+                  <span className="text-slate-300">{selectedPosition.token0.symbol}</span>
+                  <span className="text-white font-medium">
+                    {formatAmount(
+                      (selectedPosition.reserve0 * ((selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n)) / selectedPosition.totalSupply,
+                      selectedPosition.token0.decimals
+                    )}
+                  </span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-slate-300">{selectedPosition.token1.symbol}</span>
+                  <span className="text-white font-medium">
+                    {formatAmount(
+                      (selectedPosition.reserve1 * ((selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n)) / selectedPosition.totalSupply,
+                      selectedPosition.token1.decimals
+                    )}
+                  </span>
+                </div>
+              </div>
+
               <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
                 <p className="text-xs text-yellow-400">
-                  <strong>Note:</strong> Migration will use full price range for safety. You can adjust the range later.
+                  <strong>Note:</strong> Migration will use full price range for safety. You can adjust the range later by removing and re-adding liquidity with a custom range.
                 </p>
               </div>
             </CardContent>
@@ -455,10 +518,10 @@ export function MigrateV2ToV3() {
           {isConnected ? (
             <Button
               onClick={handleMigrate}
-              disabled={isMigrating}
+              disabled={isMigrating || migratorExists === false}
               className="w-full h-12 text-base font-semibold"
             >
-              {isMigrating ? "Migrating..." : "Migrate to V3"}
+              {isMigrating ? "Migrating..." : migratorExists === false ? "Migrator Not Available" : "Migrate to V3"}
             </Button>
           ) : (
             <Button disabled className="w-full h-12">

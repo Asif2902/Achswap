@@ -7,19 +7,37 @@ import { TokenSelector } from "@/components/TokenSelector";
 import { useAccount, useChainId } from "wagmi";
 import { useToast } from "@/hooks/use-toast";
 import type { Token } from "@shared/schema";
-import { Contract, BrowserProvider } from "ethers";
-import { getTokensByChainId } from "@/data/tokens";
+import { Contract, BrowserProvider, parseUnits } from "ethers";
+import { getTokensByChainId, isNativeToken, getWrappedAddress } from "@/data/tokens";
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { priceToSqrtPriceX96, getWideRangeTicks, sortTokens, getPriceFromAmounts, sqrtPriceX96ToPrice, getFullRangeTicks } from "@/lib/v3-utils";
 import { calculateAmountsForLiquidity } from "@/lib/v3-liquidity-math";
-import { AlertTriangle, Info, Shield, ExternalLink } from "lucide-react";
+import { AlertTriangle, Info, Shield, ExternalLink, ArrowDownUp } from "lucide-react";
 
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
+
+const WRAPPED_TOKEN_ABI = [
+  "function deposit() payable",
+  "function withdraw(uint256 amount) returns (bool)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+];
+
+/**
+ * Get the ERC20 address for a token - if native, return wrapped address
+ */
+function getERC20Address(token: Token, chainId: number): string {
+  if (isNativeToken(token.address)) {
+    const wrapped = getWrappedAddress(chainId, token.address);
+    return wrapped || token.address;
+  }
+  return token.address;
+}
 
 export function AddLiquidityV3Basic() {
   const [tokenA, setTokenA] = useState<Token | null>(null);
@@ -72,17 +90,25 @@ export function AddLiquidityV3Basic() {
     }
   }, [tokens, tokenA, tokenB]);
 
+  // Check if either token needs wrapping (native -> ERC20)
+  const needsWrapA = tokenA ? isNativeToken(tokenA.address) : false;
+  const needsWrapB = tokenB ? isNativeToken(tokenB.address) : false;
+  const needsWrapping = needsWrapA || needsWrapB;
+
   // Check if pool exists and get current price
   useEffect(() => {
     const checkPool = async () => {
-      if (!tokenA || !tokenB || !contracts || !window.ethereum) return;
+      if (!tokenA || !tokenB || !contracts || !window.ethereum || !chainId) return;
 
       setIsCheckingPool(true);
       try {
         const provider = new BrowserProvider(window.ethereum);
         const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
 
-        const [token0, token1] = sortTokens(tokenA, tokenB);
+        // Use ERC20 addresses for pool lookup (native tokens use their wrapped version)
+        const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
+        const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
+        const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
         const poolAddress = await factory.getPool(token0.address, token1.address, selectedFee);
 
         if (poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000") {
@@ -121,14 +147,17 @@ export function AddLiquidityV3Basic() {
 
   // Auto-calculate amountB based on current price and tick range
   useEffect(() => {
-    if (!currentSqrtPriceX96 || !amountA || !tokenA || !tokenB || !currentTick) return;
+    if (!currentSqrtPriceX96 || !amountA || !tokenA || !tokenB || !currentTick || !chainId) return;
 
     const amountAFloat = parseFloat(amountA);
     if (isNaN(amountAFloat) || amountAFloat <= 0) return;
 
     try {
-      const [token0, token1] = sortTokens(tokenA, tokenB);
-      const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
+      // Use ERC20 addresses for sorting (V3 uses wrapped tokens)
+      const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
+      const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
+      const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
+      const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
 
       // Get tick range for full range position
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
@@ -156,9 +185,11 @@ export function AddLiquidityV3Basic() {
     } catch (error) {
       console.error("Error calculating amount:", error);
       // Fallback to simple price calculation
-      if (currentPrice) {
-        const [token0] = sortTokens(tokenA, tokenB);
-        const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
+      if (currentPrice && chainId) {
+        const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
+        const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
+        const [token0] = sortTokens(tokenAForPool, tokenBForPool);
+        const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
         const calculatedAmountB = isToken0A 
           ? amountAFloat * currentPrice 
           : amountAFloat / currentPrice;
@@ -168,7 +199,7 @@ export function AddLiquidityV3Basic() {
   }, [amountA, currentSqrtPriceX96, currentTick, tokenA, tokenB, selectedFee, currentPrice]);
 
   const handleAddLiquidity = async () => {
-    if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum) return;
+    if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum || !chainId) return;
 
     setIsAdding(true);
     try {
@@ -181,9 +212,50 @@ export function AddLiquidityV3Basic() {
         signer
       );
 
-      // Sort tokens - CRITICAL: V3 requires token0 < token1 by address
-      const [token0, token1] = sortTokens(tokenA, tokenB);
-      const isToken0A = tokenA.address.toLowerCase() === token0.address.toLowerCase();
+      // CRITICAL: V3 only works with ERC20 tokens - wrap native tokens first
+      const tokenAIsNative = isNativeToken(tokenA.address);
+      const tokenBIsNative = isNativeToken(tokenB.address);
+
+      // Get ERC20 addresses for V3 (native tokens use their wrapped version)
+      const tokenAERC20 = getERC20Address(tokenA, chainId);
+      const tokenBERC20 = getERC20Address(tokenB, chainId);
+
+      // Wrap native tokens if needed
+      if (tokenAIsNative) {
+        const wrappedAddress = getWrappedAddress(chainId, tokenA.address);
+        if (!wrappedAddress) throw new Error("No wrapped token found for native token");
+        
+        toast({
+          title: "Wrapping native token...",
+          description: `Wrapping ${tokenA.symbol} to w${tokenA.symbol}`,
+        });
+
+        const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
+        const wrapAmount = parseAmount(amountA, tokenA.decimals);
+        const wrapTx = await wrappedContract.deposit({ value: wrapAmount });
+        await wrapTx.wait();
+      }
+
+      if (tokenBIsNative) {
+        const wrappedAddress = getWrappedAddress(chainId, tokenB.address);
+        if (!wrappedAddress) throw new Error("No wrapped token found for native token");
+        
+        toast({
+          title: "Wrapping native token...",
+          description: `Wrapping ${tokenB.symbol} to w${tokenB.symbol}`,
+        });
+
+        const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
+        const wrapAmount = parseAmount(amountB, tokenB.decimals);
+        const wrapTx = await wrappedContract.deposit({ value: wrapAmount });
+        await wrapTx.wait();
+      }
+
+      // Sort tokens using ERC20 addresses - CRITICAL: V3 requires token0 < token1 by address
+      const tokenAForPool = { ...tokenA, address: tokenAERC20 };
+      const tokenBForPool = { ...tokenB, address: tokenBERC20 };
+      const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
+      const isToken0A = tokenAERC20.toLowerCase() === token0.address.toLowerCase();
 
       const amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
       const amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
@@ -214,7 +286,7 @@ export function AddLiquidityV3Basic() {
       // Get ticks - use full range for maximum safety in Basic mode
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
-      // Approve tokens
+      // Approve tokens (using ERC20 addresses)
       toast({
         title: "Approving tokens...",
         description: "Please approve token spending",
@@ -413,6 +485,19 @@ export function AddLiquidityV3Basic() {
                 <p className="text-slate-400 text-xs">A new pool will be created with your initial price ratio</p>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Wrapping Notice */}
+      {needsWrapping && tokenA && tokenB && (
+        <div className="flex items-start gap-3 p-4 bg-orange-500/10 border border-orange-500/20 rounded-lg">
+          <ArrowDownUp className="h-5 w-5 text-orange-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <h3 className="font-semibold text-orange-400 text-sm">Auto-Wrapping Required</h3>
+            <p className="text-xs text-slate-300">
+              V3 pools require ERC20 tokens. Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped to {needsWrapA ? `w${tokenA.symbol}` : `w${tokenB.symbol}`} before adding liquidity.
+            </p>
           </div>
         </div>
       )}

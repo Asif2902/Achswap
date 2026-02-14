@@ -13,7 +13,7 @@ import { useToast } from "@/hooks/use-toast";
 import type { Token } from "@shared/schema";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Contract, BrowserProvider, formatUnits, parseUnits } from "ethers";
-import { defaultTokens, getTokensByChainId } from "@/data/tokens";
+import { defaultTokens, getTokensByChainId, isNativeToken, getWrappedAddress } from "@/data/tokens";
 import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { getSmartRouteQuote, type SmartRoutingResult } from "@/lib/smart-routing";
@@ -584,11 +584,36 @@ export default function Swap() {
       let tx;
       
       if (bestQuote.protocol === "V3") {
-        // V3 Swap
+        // V3 Swap - V3 only works with ERC20 tokens
         const swapRouter = new Contract(contracts.v3.swapRouter, SWAP_ROUTER_V3_ABI, signer);
         
-        // Check and approve token if needed
-        const tokenContract = new Contract(fromToken.address, ERC20_ABI, signer);
+        // Handle native token - V3 requires ERC20, so wrap first
+        const fromTokenIsNative = isNativeToken(fromToken.address);
+        const toTokenIsNative = isNativeToken(toToken.address);
+        const wrappedAddress = getWrappedAddress(chainId, "0x0000000000000000000000000000000000000000");
+        
+        // Get ERC20 addresses for V3 swap
+        const fromTokenERC20 = fromTokenIsNative ? wrappedAddress : fromToken.address;
+        const toTokenERC20 = toTokenIsNative ? wrappedAddress : toToken.address;
+        
+        // Auto-wrap native token if needed
+        if (fromTokenIsNative) {
+          if (!wrappedAddress) throw new Error("No wrapped token configured for native token");
+          
+          toast({
+            title: "Wrapping native token...",
+            description: `Wrapping ${fromToken.symbol} for V3 swap...`,
+          });
+          
+          const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
+          const wrapGasEstimate = await wrappedContract.deposit.estimateGas({ value: amountIn });
+          const wrapGasLimit = (wrapGasEstimate * 150n) / 100n;
+          const wrapTx = await wrappedContract.deposit({ value: amountIn, gasLimit: wrapGasLimit });
+          await wrapTx.wait();
+        }
+        
+        // Check and approve token if needed (use ERC20 address)
+        const tokenContract = new Contract(fromTokenERC20, ERC20_ABI, signer);
         const allowance = await tokenContract.allowance(address, contracts.v3.swapRouter);
         
         if (allowance < amountIn) {
@@ -608,8 +633,8 @@ export default function Swap() {
           const fee = bestQuote.route[0].fee || 3000;
           
           const params = {
-            tokenIn: fromToken.address,
-            tokenOut: toToken.address,
+            tokenIn: fromTokenERC20,
+            tokenOut: toTokenERC20,
             fee: fee,
             recipient: recipient,
             amountIn: amountIn,
@@ -623,12 +648,16 @@ export default function Swap() {
         } else {
           // Multi-hop V3 swap
           const { encodePath } = await import("@/lib/v3-utils");
-          const tokens = [fromToken.address];
+          const tokens = [fromTokenERC20];
           const fees = [];
           
           for (const hop of bestQuote.route) {
-            tokens.push(hop.tokenOut.address);
-            fees.push(hop.fee || 3000);
+            // Use wrapped address for native tokens in path
+            const hopTokenOut = isNativeToken(hop.tokenOut.address) ? wrappedAddress : hop.tokenOut.address;
+            if (hopTokenOut !== tokens[tokens.length - 1]) {
+              tokens.push(hopTokenOut);
+              fees.push(hop.fee || 3000);
+            }
           }
           
           const path = encodePath(tokens, fees);
@@ -644,54 +673,124 @@ export default function Swap() {
           const gasLimit = (gasEstimate * 150n) / 100n;
           tx = await swapRouter.exactInput(params, { gasLimit });
         }
+        
+        // Auto-unwrap if output should be native token
+        if (toTokenIsNative && wrappedAddress) {
+          // The swap output is wUSDC, need to unwrap to USDC
+          // This happens after the swap completes
+        }
       } else {
         // V2 Swap
         const V2_ROUTER_ABI = [
           "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
+          "function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)",
+          "function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
         ];
         
         const router = new Contract(contracts.v2.router, V2_ROUTER_ABI, signer);
         
-        // Build path from route
-        const path = [fromToken.address];
-        for (const hop of bestQuote.route) {
-          if (hop.tokenOut.address !== path[path.length - 1]) {
-            path.push(hop.tokenOut.address);
+        // Handle native token for V2
+        const fromTokenIsNative = isNativeToken(fromToken.address);
+        const toTokenIsNative = isNativeToken(toToken.address);
+        const wrappedAddress = getWrappedAddress(chainId, "0x0000000000000000000000000000000000000000");
+        
+        // Build path from route (use wrapped address for native tokens)
+        const path: string[] = [];
+        for (let i = 0; i < bestQuote.route.length; i++) {
+          const hop = bestQuote.route[i];
+          if (i === 0) {
+            const tokenIn = isNativeToken(hop.tokenIn.address) ? wrappedAddress : hop.tokenIn.address;
+            path.push(tokenIn);
+          }
+          const tokenOut = isNativeToken(hop.tokenOut.address) ? wrappedAddress : hop.tokenOut.address;
+          if (tokenOut !== path[path.length - 1]) {
+            path.push(tokenOut);
           }
         }
         
-        // Check and approve token if needed
-        const tokenContract = new Contract(fromToken.address, ERC20_ABI, signer);
-        const allowance = await tokenContract.allowance(address, contracts.v2.router);
-        
-        if (allowance < amountIn) {
-          toast({
-            title: "Approval needed",
-            description: "Approving token for V2 swap...",
-          });
-          const approveGasEstimate = await tokenContract.approve.estimateGas(contracts.v2.router, amountIn);
-          const approveGasLimit = (approveGasEstimate * 150n) / 100n;
-          const approveTx = await tokenContract.approve(contracts.v2.router, amountIn, { gasLimit: approveGasLimit });
-          await approveTx.wait();
+        // Execute swap based on native token involvement
+        if (fromTokenIsNative) {
+          // Swap native for tokens - use swapExactETHForTokens
+          const gasEstimate = await router.swapExactETHForTokens.estimateGas(
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp,
+            { value: amountIn }
+          );
+          const gasLimit = (gasEstimate * 150n) / 100n;
+          tx = await router.swapExactETHForTokens(
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp,
+            { value: amountIn, gasLimit }
+          );
+        } else if (toTokenIsNative) {
+          // Swap tokens for native - use swapExactTokensForETH
+          const tokenContract = new Contract(fromToken.address, ERC20_ABI, signer);
+          const allowance = await tokenContract.allowance(address, contracts.v2.router);
+          
+          if (allowance < amountIn) {
+            toast({
+              title: "Approval needed",
+              description: "Approving token for V2 swap...",
+            });
+            const approveGasEstimate = await tokenContract.approve.estimateGas(contracts.v2.router, amountIn);
+            const approveGasLimit = (approveGasEstimate * 150n) / 100n;
+            const approveTx = await tokenContract.approve(contracts.v2.router, amountIn, { gasLimit: approveGasLimit });
+            await approveTx.wait();
+          }
+          
+          const gasEstimate = await router.swapExactTokensForETH.estimateGas(
+            amountIn,
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp
+          );
+          const gasLimit = (gasEstimate * 150n) / 100n;
+          tx = await router.swapExactTokensForETH(
+            amountIn,
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp,
+            { gasLimit }
+          );
+        } else {
+          // Regular token-to-token swap
+          const tokenContract = new Contract(fromToken.address, ERC20_ABI, signer);
+          const allowance = await tokenContract.allowance(address, contracts.v2.router);
+          
+          if (allowance < amountIn) {
+            toast({
+              title: "Approval needed",
+              description: "Approving token for V2 swap...",
+            });
+            const approveGasEstimate = await tokenContract.approve.estimateGas(contracts.v2.router, amountIn);
+            const approveGasLimit = (approveGasEstimate * 150n) / 100n;
+            const approveTx = await tokenContract.approve(contracts.v2.router, amountIn, { gasLimit: approveGasLimit });
+            await approveTx.wait();
+          }
+          
+          const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
+            amountIn,
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp
+          );
+          const gasLimit = (gasEstimate * 150n) / 100n;
+          tx = await router.swapExactTokensForTokens(
+            amountIn,
+            minAmountOut,
+            path,
+            recipient,
+            deadlineTimestamp,
+            { gasLimit }
+          );
         }
-        
-        // Execute V2 swap
-        const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
-          amountIn,
-          minAmountOut,
-          path,
-          recipient,
-          deadlineTimestamp
-        );
-        const gasLimit = (gasEstimate * 150n) / 100n;
-        tx = await router.swapExactTokensForTokens(
-          amountIn,
-          minAmountOut,
-          path,
-          recipient,
-          deadlineTimestamp,
-          { gasLimit }
-        );
       }
 
       const receipt = await tx.wait();

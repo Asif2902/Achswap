@@ -9,6 +9,23 @@ const V2_ROUTER_ABI = [
   "function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)",
 ];
 
+// Native token address (zero address)
+const NATIVE_TOKEN_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/**
+ * Check if token is native (zero address)
+ */
+function isNativeToken(address: string): boolean {
+  return address === NATIVE_TOKEN_ADDRESS;
+}
+
+/**
+ * Get ERC20 address for a token (wraps native to wrapped)
+ */
+function getERC20Address(tokenAddress: string, wrappedTokenAddress: string): string {
+  return isNativeToken(tokenAddress) ? wrappedTokenAddress : tokenAddress;
+}
+
 export interface QuoteResult {
   protocol: "V2" | "V3";
   outputAmount: bigint;
@@ -76,6 +93,7 @@ export async function getV2Quote(
 
 /**
  * Get V3 quote for a swap (single-hop and multi-hop)
+ * V3 only works with ERC20 tokens, so native tokens must use wrapped address
  */
 export async function getV3Quote(
   provider: BrowserProvider,
@@ -93,6 +111,11 @@ export async function getV3Quote(
       return null;
     }
 
+    if (!wrappedTokenAddress) {
+      console.warn("Wrapped token address required for V3 quotes");
+      return null;
+    }
+
     const quoter = new Contract(quoterAddress, QUOTER_V2_ABI, provider);
     
     const feeTiers = [
@@ -103,12 +126,16 @@ export async function getV3Quote(
     
     let bestQuote: QuoteResult | null = null;
     
+    // V3 only works with ERC20 tokens - use wrapped address for native tokens
+    const fromTokenERC20 = getERC20Address(fromToken.address, wrappedTokenAddress);
+    const toTokenERC20 = getERC20Address(toToken.address, wrappedTokenAddress);
+    
     // Try single-hop routes for all fee tiers
     for (const fee of feeTiers) {
       try {
         const params = {
-          tokenIn: fromToken.address,
-          tokenOut: toToken.address,
+          tokenIn: fromTokenERC20,
+          tokenOut: toTokenERC20,
           amountIn: amountIn,
           fee: fee,
           sqrtPriceLimitX96: 0,
@@ -121,8 +148,8 @@ export async function getV3Quote(
         if (!bestQuote || outputAmount > bestQuote.outputAmount) {
           const priceImpact = await calculateV3PriceImpact(
             quoter,
-            fromToken,
-            toToken,
+            fromTokenERC20,
+            toTokenERC20,
             amountIn,
             outputAmount,
             fee
@@ -132,8 +159,8 @@ export async function getV3Quote(
             protocol: "V3",
             outputAmount,
             route: [{
-              tokenIn: fromToken,
-              tokenOut: toToken,
+              tokenIn: fromToken, // Keep original token for display
+              tokenOut: toToken, // Keep original token for display
               protocol: "V3",
               fee,
             }],
@@ -147,14 +174,16 @@ export async function getV3Quote(
       }
     }
     
-    // Try multi-hop routes if wrapped token provided
-    if (wrappedTokenAddress && wrappedTokenAddress.toLowerCase() !== fromToken.address.toLowerCase() && wrappedTokenAddress.toLowerCase() !== toToken.address.toLowerCase()) {
+    // Try multi-hop routes if needed (through wrapped token)
+    // Only if both tokens are not the wrapped token itself
+    if (wrappedTokenAddress.toLowerCase() !== fromTokenERC20.toLowerCase() && 
+        wrappedTokenAddress.toLowerCase() !== toTokenERC20.toLowerCase()) {
       for (const fee1 of feeTiers) {
         for (const fee2 of feeTiers) {
           try {
             const { encodePath } = await import("./v3-utils");
             const path = encodePath(
-              [fromToken.address, wrappedTokenAddress, toToken.address],
+              [fromTokenERC20, wrappedTokenAddress, toTokenERC20],
               [fee1, fee2]
             );
             
@@ -327,8 +356,8 @@ async function calculateV2PriceImpact(
  */
 async function calculateV3PriceImpact(
   quoter: Contract,
-  fromToken: Token,
-  toToken: Token,
+  tokenInAddress: string,
+  tokenOutAddress: string,
   amountIn: bigint,
   outputAmount: bigint,
   fee: number
@@ -338,8 +367,8 @@ async function calculateV3PriceImpact(
     
     if (halfAmountBigInt > 0n) {
       const params = {
-        tokenIn: fromToken.address,
-        tokenOut: toToken.address,
+        tokenIn: tokenInAddress,
+        tokenOut: tokenOutAddress,
         amountIn: halfAmountBigInt,
         fee: fee,
         sqrtPriceLimitX96: 0,
