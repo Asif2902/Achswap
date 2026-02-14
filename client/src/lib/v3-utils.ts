@@ -13,8 +13,10 @@ const MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342n;
  * Price is token1/token0 in human-readable format
  */
 export function priceToSqrtPriceX96(price: number, token0Decimals: number, token1Decimals: number): bigint {
-  // Adjust price for decimals
-  const adjustedPrice = price * (10 ** (token0Decimals - token1Decimals));
+  // Adjust price for decimals: divide by 10^(token0Decimals - token1Decimals)
+  // This converts from human-readable price to raw price
+  const decimalAdjustment = 10 ** (token0Decimals - token1Decimals);
+  const adjustedPrice = price / decimalAdjustment;
   
   // Calculate sqrt(price) * 2^96
   const sqrtPrice = Math.sqrt(adjustedPrice);
@@ -29,10 +31,14 @@ export function priceToSqrtPriceX96(price: number, token0Decimals: number, token
 
 /**
  * Convert sqrtPriceX96 to human-readable price
+ * Returns price as token1/token0 (how many token1 per token0)
  */
 export function sqrtPriceX96ToPrice(sqrtPriceX96: bigint, token0Decimals: number, token1Decimals: number): number {
   const price = (Number(sqrtPriceX96) / Number(Q96)) ** 2;
-  const adjustedPrice = price / (10 ** (token0Decimals - token1Decimals));
+  // Adjust for decimals: multiply by 10^(token0Decimals - token1Decimals)
+  // This converts from raw price to human-readable price
+  const decimalAdjustment = 10 ** (token0Decimals - token1Decimals);
+  const adjustedPrice = price * decimalAdjustment;
   return adjustedPrice;
 }
 
@@ -67,9 +73,12 @@ export function getNearestUsableTick(tick: number, tickSpacing: number): number 
 
 /**
  * Calculate tick from price
+ * Price is token1/token0 in human-readable format
  */
 export function priceToTick(price: number, token0Decimals: number, token1Decimals: number): number {
-  const adjustedPrice = price * (10 ** (token0Decimals - token1Decimals));
+  // Convert human-readable price to raw price
+  const decimalAdjustment = 10 ** (token0Decimals - token1Decimals);
+  const adjustedPrice = price / decimalAdjustment;
   const tick = Math.floor(Math.log(adjustedPrice) / Math.log(1.0001));
   
   if (tick < MIN_TICK) return MIN_TICK;
@@ -80,10 +89,13 @@ export function priceToTick(price: number, token0Decimals: number, token1Decimal
 
 /**
  * Calculate price from tick
+ * Returns human-readable price (token1/token0)
  */
 export function tickToPrice(tick: number, token0Decimals: number, token1Decimals: number): number {
-  const price = 1.0001 ** tick;
-  return price / (10 ** (token0Decimals - token1Decimals));
+  const rawPrice = 1.0001 ** tick;
+  // Convert raw price to human-readable price
+  const decimalAdjustment = 10 ** (token0Decimals - token1Decimals);
+  return rawPrice * decimalAdjustment;
 }
 
 /**

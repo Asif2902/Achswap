@@ -9,8 +9,9 @@ import { Contract, BrowserProvider } from "ethers";
 import { getTokensByChainId } from "@/data/tokens";
 import { formatAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
-import { V3_MIGRATOR_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
-import { ArrowRight, AlertCircle, ExternalLink, RefreshCw, CheckCircle2 } from "lucide-react";
+import { V3_MIGRATOR_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
+import { priceToSqrtPriceX96, sqrtPriceX96ToPrice, getPriceFromAmounts, getFullRangeTicks } from "@/lib/v3-utils";
+import { ArrowRight, AlertCircle, ExternalLink, RefreshCw, CheckCircle2, AlertTriangle } from "lucide-react";
 
 const V2_PAIR_ABI = [
   "function token0() external view returns (address)",
@@ -45,6 +46,14 @@ interface V2Position {
   sharePercent: number;
 }
 
+interface V3PoolInfo {
+  exists: boolean;
+  address: string | null;
+  currentPrice: number | null;
+  currentTick: number | null;
+  sqrtPriceX96: bigint | null;
+}
+
 export function MigrateV2ToV3() {
   const [positions, setPositions] = useState<V2Position[]>([]);
   const [selectedPosition, setSelectedPosition] = useState<V2Position | null>(null);
@@ -53,6 +62,9 @@ export function MigrateV2ToV3() {
   const [selectedFee, setSelectedFee] = useState<number>(V3_FEE_TIERS.MEDIUM);
   const [percentToMigrate, setPercentToMigrate] = useState(100);
   const [migratorExists, setMigratorExists] = useState<boolean | null>(null);
+  const [v3PoolInfo, setV3PoolInfo] = useState<V3PoolInfo | null>(null);
+  const [isCheckingPool, setIsCheckingPool] = useState(false);
+  const [priceWarningConfirmed, setPriceWarningConfirmed] = useState(false);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -82,6 +94,96 @@ export function MigrateV2ToV3() {
     };
     checkMigrator();
   }, [contracts]);
+
+  // Check V3 pool status when position or fee tier changes
+  useEffect(() => {
+    const checkV3Pool = async () => {
+      if (!selectedPosition || !contracts || !window.ethereum) {
+        setV3PoolInfo(null);
+        return;
+      }
+
+      setIsCheckingPool(true);
+      try {
+        const provider = new BrowserProvider(window.ethereum);
+        const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
+
+        const poolAddress = await factory.getPool(
+          selectedPosition.token0.address,
+          selectedPosition.token1.address,
+          selectedFee
+        );
+
+        if (poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000") {
+          // Pool exists - get current price
+          const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
+          const slot0 = await pool.slot0();
+          const sqrtPriceX96 = slot0[0];
+          const tick = Number(slot0[1]);
+
+          const currentPrice = sqrtPriceX96ToPrice(
+            sqrtPriceX96,
+            selectedPosition.token0.decimals,
+            selectedPosition.token1.decimals
+          );
+
+          setV3PoolInfo({
+            exists: true,
+            address: poolAddress,
+            currentPrice,
+            currentTick: tick,
+            sqrtPriceX96,
+          });
+        } else {
+          // Pool doesn't exist
+          setV3PoolInfo({
+            exists: false,
+            address: null,
+            currentPrice: null,
+            currentTick: null,
+            sqrtPriceX96: null,
+          });
+        }
+      } catch (error) {
+        console.error("Error checking V3 pool:", error);
+        setV3PoolInfo({
+          exists: false,
+          address: null,
+          currentPrice: null,
+          currentTick: null,
+          sqrtPriceX96: null,
+        });
+      } finally {
+        setIsCheckingPool(false);
+      }
+    };
+
+    checkV3Pool();
+    setPriceWarningConfirmed(false); // Reset confirmation when pool/fee changes
+  }, [selectedPosition, selectedFee, contracts]);
+
+  // Calculate V2 price
+  const getV2Price = (): number | null => {
+    if (!selectedPosition) return null;
+    return getPriceFromAmounts(
+      selectedPosition.reserve0,
+      selectedPosition.reserve1,
+      selectedPosition.token0.decimals,
+      selectedPosition.token1.decimals
+    );
+  };
+
+  // Check if prices differ significantly (more than 2%)
+  const getPriceDifference = (): { diff: number; v2Price: number; v3Price: number } | null => {
+    const v2Price = getV2Price();
+    if (!v2Price || !v3PoolInfo?.currentPrice) return null;
+
+    const diff = Math.abs((v3PoolInfo.currentPrice - v2Price) / v2Price) * 100;
+    return { diff, v2Price, v3Price: v3PoolInfo.currentPrice };
+  };
+
+  const priceDiff = getPriceDifference();
+  const showPriceWarning = priceDiff && priceDiff.diff > 2 && !priceWarningConfirmed;
 
   // Load user's V2 positions
   const loadPositions = async () => {
@@ -195,6 +297,16 @@ export function MigrateV2ToV3() {
   const handleMigrate = async () => {
     if (!selectedPosition || !address || !contracts || !window.ethereum || !migratorExists) return;
 
+    // Check price warning confirmation
+    if (showPriceWarning) {
+      toast({
+        title: "Confirmation required",
+        description: "Please confirm the price difference before migrating",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsMigrating(true);
     try {
       const provider = new BrowserProvider(window.ethereum);
@@ -212,32 +324,44 @@ export function MigrateV2ToV3() {
       const amount0Min = (amount0 * 98n) / 100n;
       const amount1Min = (amount1 * 98n) / 100n;
 
-      // CRITICAL: Create V3 pool first if it doesn't exist
-      // Calculate price from V2 reserves
-      const { priceToSqrtPriceX96, getPriceFromAmounts } = await import("@/lib/v3-utils");
-      const price = getPriceFromAmounts(
-        selectedPosition.reserve0, 
-        selectedPosition.reserve1, 
-        selectedPosition.token0.decimals, 
-        selectedPosition.token1.decimals
-      );
-      const sqrtPriceX96 = priceToSqrtPriceX96(price, selectedPosition.token0.decimals, selectedPosition.token1.decimals);
+      // Handle pool creation/initialization
+      let sqrtPriceX96: bigint;
 
-      toast({
-        title: "Ensuring V3 pool exists...",
-        description: "Creating or verifying V3 pool for migration",
-      });
-
-      try {
-        const createTx = await migrator.createAndInitializePoolIfNecessary(
-          selectedPosition.token0.address,
-          selectedPosition.token1.address,
-          selectedFee,
-          sqrtPriceX96
+      if (v3PoolInfo?.exists && v3PoolInfo.sqrtPriceX96) {
+        // Pool exists - use existing price (no need to create)
+        sqrtPriceX96 = v3PoolInfo.sqrtPriceX96;
+        toast({
+          title: "Using existing V3 pool",
+          description: "Pool already exists with current price",
+        });
+      } else {
+        // Pool doesn't exist - create with V2 price
+        const v2Price = getV2Price();
+        if (!v2Price) throw new Error("Could not calculate V2 price");
+        
+        sqrtPriceX96 = priceToSqrtPriceX96(
+          v2Price,
+          selectedPosition.token0.decimals,
+          selectedPosition.token1.decimals
         );
-        await createTx.wait();
-      } catch (poolError: any) {
-        console.log("Pool creation note:", poolError.message);
+
+        toast({
+          title: "Creating V3 pool...",
+          description: "Initializing new pool with V2 price",
+        });
+
+        try {
+          const createTx = await migrator.createAndInitializePoolIfNecessary(
+            selectedPosition.token0.address,
+            selectedPosition.token1.address,
+            selectedFee,
+            sqrtPriceX96
+          );
+          await createTx.wait();
+        } catch (poolError: any) {
+          // Pool might have been created by another transaction
+          console.log("Pool creation note:", poolError.message);
+        }
       }
 
       // Approve LP tokens
@@ -253,7 +377,6 @@ export function MigrateV2ToV3() {
       }
 
       // Use full range for safety
-      const { getFullRangeTicks } = await import("@/lib/v3-utils");
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
       toast({
@@ -283,6 +406,8 @@ export function MigrateV2ToV3() {
       const receipt = await tx.wait();
 
       setSelectedPosition(null);
+      setV3PoolInfo(null);
+      setPriceWarningConfirmed(false);
       await loadPositions(); // Reload positions
 
       toast({
@@ -460,6 +585,88 @@ export function MigrateV2ToV3() {
             </CardContent>
           </Card>
 
+          {/* V3 Pool Status */}
+          {isCheckingPool ? (
+            <Card className="bg-slate-900 border-slate-700">
+              <CardContent className="p-4 text-center text-slate-400">
+                Checking V3 pool status...
+              </CardContent>
+            </Card>
+          ) : v3PoolInfo && (
+            <Card className="bg-slate-900 border-slate-700">
+              <CardContent className="p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-slate-400">V3 Pool Status</span>
+                  {v3PoolInfo.exists ? (
+                    <span className="text-sm text-green-400 flex items-center gap-1">
+                      <CheckCircle2 className="h-4 w-4" />
+                      Exists
+                    </span>
+                  ) : (
+                    <span className="text-sm text-yellow-400 flex items-center gap-1">
+                      <AlertTriangle className="h-4 w-4" />
+                      Will be created
+                    </span>
+                  )}
+                </div>
+
+                {/* Price Comparison */}
+                {v3PoolInfo.exists && v3PoolInfo.currentPrice && (
+                  <div className="space-y-2 pt-2 border-t border-slate-700">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">V2 Price ({selectedPosition.token1.symbol}/{selectedPosition.token0.symbol})</span>
+                      <span className="text-white">{getV2Price()?.toFixed(6)}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">V3 Price ({selectedPosition.token1.symbol}/{selectedPosition.token0.symbol})</span>
+                      <span className="text-white">{v3PoolInfo.currentPrice.toFixed(6)}</span>
+                    </div>
+                    {priceDiff && (
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-slate-400">Price Difference</span>
+                        <span className={priceDiff.diff > 2 ? "text-yellow-400" : "text-green-400"}>
+                          {priceDiff.diff.toFixed(2)}%
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Price Warning */}
+          {showPriceWarning && (
+            <Card className="bg-yellow-500/10 border-yellow-500/20">
+              <CardContent className="p-4 space-y-3">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />
+                  <div className="space-y-2">
+                    <h4 className="font-semibold text-yellow-400 text-sm">Price Difference Warning</h4>
+                    <p className="text-xs text-slate-300">
+                      The V3 pool price differs from V2 by {priceDiff?.diff.toFixed(2)}%. This could result in:
+                    </p>
+                    <ul className="text-xs text-slate-400 list-disc list-inside space-y-1">
+                      <li>Impermanent loss when adding liquidity</li>
+                      <li>Receiving fewer tokens than expected</li>
+                      <li>Arbitrage opportunities for other users</li>
+                    </ul>
+                    <div className="flex items-center gap-2 pt-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/20"
+                        onClick={() => setPriceWarningConfirmed(true)}
+                      >
+                        I understand, proceed anyway
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Migration Preview */}
           <Card className="bg-slate-900 border-slate-700">
             <CardContent className="p-6 space-y-4">
@@ -506,28 +713,24 @@ export function MigrateV2ToV3() {
                 </div>
               </div>
 
-              <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-                <p className="text-xs text-yellow-400">
-                  <strong>Note:</strong> Migration will use full price range for safety. You can adjust the range later by removing and re-adding liquidity with a custom range.
-                </p>
-              </div>
+              <Button
+                onClick={handleMigrate}
+                disabled={
+                  !migratorExists || 
+                  isMigrating || 
+                  showPriceWarning ||
+                  isCheckingPool
+                }
+                className="w-full h-12 text-base font-semibold"
+              >
+                {isMigrating 
+                  ? "Migrating..." 
+                  : showPriceWarning 
+                    ? "Confirm Price Warning Above" 
+                    : "Migrate to V3"}
+              </Button>
             </CardContent>
           </Card>
-
-          {/* Migrate Button */}
-          {isConnected ? (
-            <Button
-              onClick={handleMigrate}
-              disabled={isMigrating || migratorExists === false}
-              className="w-full h-12 text-base font-semibold"
-            >
-              {isMigrating ? "Migrating..." : migratorExists === false ? "Migrator Not Available" : "Migrate to V3"}
-            </Button>
-          ) : (
-            <Button disabled className="w-full h-12">
-              Connect Wallet
-            </Button>
-          )}
         </>
       )}
     </div>

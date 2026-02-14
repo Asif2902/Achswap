@@ -74,8 +74,121 @@ export function AddLiquidityV3Basic() {
   useEffect(() => {
     if (!chainId) return;
     const chainTokens = getTokensByChainId(chainId);
-    setTokens(chainTokens);
+    
+    // Load imported tokens from localStorage
+    const imported = localStorage.getItem('importedTokens');
+    const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
+    const chainImportedTokens = importedTokens.filter(t => t.chainId === chainId);
+    
+    setTokens([...chainTokens, ...chainImportedTokens]);
   }, [chainId]);
+
+  const handleImportToken = async (address: string): Promise<Token | null> => {
+    try {
+      if (!address || address.length !== 42 || !address.startsWith('0x')) {
+        throw new Error("Invalid token address format");
+      }
+
+      // Check if token already exists
+      const exists = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
+      if (exists) {
+        toast({
+          title: "Token already added",
+          description: `${exists.symbol} is already in your token list`,
+        });
+        return exists;
+      }
+
+      // Use public RPC for token data
+      const rpcUrl = 'https://rpc.testnet.arc.network';
+      const provider = new BrowserProvider({
+        request: async ({ method, params }: any) => {
+          const response = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method,
+              params,
+            }),
+          });
+          const data = await response.json();
+          if (data.error) throw new Error(data.error.message);
+          return data.result;
+        },
+      });
+      
+      const ERC20_META_ABI = [
+        "function name() view returns (string)",
+        "function symbol() view returns (string)",
+        "function decimals() view returns (uint8)",
+      ];
+      
+      const contract = new Contract(address, ERC20_META_ABI, provider);
+
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Request timed out")), 10000)
+      );
+
+      const [name, symbol, decimals] = await Promise.race([
+        Promise.all([
+          contract.name(),
+          contract.symbol(),
+          contract.decimals(),
+        ]),
+        timeout
+      ]) as [string, string, bigint];
+
+      if (!chainId) throw new Error("Chain ID not available");
+
+      const newToken: Token = {
+        address,
+        name,
+        symbol,
+        decimals: Number(decimals),
+        logoURI: "/img/logos/unknown-token.png",
+        verified: false,
+        chainId,
+      };
+
+      const imported = localStorage.getItem('importedTokens');
+      const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
+
+      const alreadyImported = importedTokens.find((t: Token) => t.address.toLowerCase() === address.toLowerCase());
+      if (!alreadyImported) {
+        importedTokens.push(newToken);
+        localStorage.setItem('importedTokens', JSON.stringify(importedTokens));
+      }
+
+      setTokens(prev => [...prev, newToken]);
+
+      toast({
+        title: "Token imported",
+        description: `${symbol} has been added to your token list`,
+      });
+
+      return newToken;
+    } catch (error: any) {
+      console.error('Token import error:', error);
+      let errorMessage = "Failed to import token";
+
+      if (error.message.includes("timeout")) {
+        errorMessage = "Request timed out. Please check the address and try again.";
+      } else if (error.message.includes("Invalid")) {
+        errorMessage = error.message;
+      } else {
+        errorMessage = "Unable to fetch token data. Please verify the address is correct.";
+      }
+
+      toast({
+        title: "Import failed",
+        description: errorMessage,
+        variant: "destructive",
+      });
+      return null;
+    }
+  };
 
   // Set default tokens
   useEffect(() => {
@@ -145,9 +258,9 @@ export function AddLiquidityV3Basic() {
     checkPool();
   }, [tokenA, tokenB, selectedFee, contracts]);
 
-  // Auto-calculate amountB based on current price and tick range
+  // Auto-calculate amountB based on current pool price
   useEffect(() => {
-    if (!currentSqrtPriceX96 || !amountA || !tokenA || !tokenB || !currentTick || !chainId) return;
+    if (!currentPrice || !amountA || !tokenA || !tokenB || !chainId) return;
 
     const amountAFloat = parseFloat(amountA);
     if (isNaN(amountAFloat) || amountAFloat <= 0) return;
@@ -159,44 +272,18 @@ export function AddLiquidityV3Basic() {
       const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
       const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
 
-      // Get tick range for full range position
-      const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
-
-      // Parse amount to bigint
-      const inputAmount = parseAmount(amountA, isToken0A ? token0.decimals : token1.decimals);
-
-      // Calculate proper amounts based on V3 liquidity math
-      const { amount0, amount1 } = calculateAmountsForLiquidity(
-        inputAmount,
-        isToken0A,
-        currentSqrtPriceX96,
-        tickLower,
-        tickUpper,
-        token0.decimals,
-        token1.decimals
-      );
-
-      // Format the calculated amount for display
+      // For V3, the currentPrice is token1/token0
+      // If user inputs token0 amount, calculate token1: amount1 = amount0 * price
+      // If user inputs token1 amount, calculate token0: amount0 = amount1 / price
       const calculatedAmountB = isToken0A 
-        ? formatAmount(amount1, token1.decimals)
-        : formatAmount(amount0, token0.decimals);
-
-      setAmountB(calculatedAmountB);
+        ? amountAFloat * currentPrice 
+        : amountAFloat / currentPrice;
+      
+      setAmountB(calculatedAmountB.toFixed(6));
     } catch (error) {
       console.error("Error calculating amount:", error);
-      // Fallback to simple price calculation
-      if (currentPrice && chainId) {
-        const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
-        const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
-        const [token0] = sortTokens(tokenAForPool, tokenBForPool);
-        const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
-        const calculatedAmountB = isToken0A 
-          ? amountAFloat * currentPrice 
-          : amountAFloat / currentPrice;
-        setAmountB(calculatedAmountB.toFixed(6));
-      }
     }
-  }, [amountA, currentSqrtPriceX96, currentTick, tokenA, tokenB, selectedFee, currentPrice]);
+  }, [amountA, currentPrice, tokenA, tokenB, selectedFee, chainId]);
 
   const handleAddLiquidity = async () => {
     if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum || !chainId) return;
@@ -526,8 +613,7 @@ export function AddLiquidityV3Basic() {
           setShowTokenASelector(false);
         }}
         tokens={tokens}
-        selectedToken={tokenA}
-        otherToken={tokenB}
+        onImport={handleImportToken}
       />
 
       <TokenSelector
@@ -538,8 +624,7 @@ export function AddLiquidityV3Basic() {
           setShowTokenBSelector(false);
         }}
         tokens={tokens}
-        selectedToken={tokenB}
-        otherToken={tokenA}
+        onImport={handleImportToken}
       />
     </div>
   );
