@@ -642,9 +642,17 @@ export default function Swap() {
             sqrtPriceLimitX96: 0n,
           };
           
-          const gasEstimate = await swapRouter.exactInputSingle.estimateGas(params);
+          // SwapRouter02 requires multicall for deadline
+          // Encode the exactInputSingle call
+          const exactInputSingleData = swapRouter.interface.encodeFunctionData("exactInputSingle", [params]);
+          
+          // Encode multicall with deadline
+          const multicallData = swapRouter.interface.encodeFunctionData("multicall", [BigInt(deadlineTimestamp), [exactInputSingleData]]);
+          
+          // Estimate gas for the multicall
+          const gasEstimate = await swapRouter.multicall.estimateGas(BigInt(deadlineTimestamp), [exactInputSingleData]);
           const gasLimit = (gasEstimate * 150n) / 100n;
-          tx = await swapRouter.exactInputSingle(params, { gasLimit });
+          tx = await swapRouter.multicall(BigInt(deadlineTimestamp), [exactInputSingleData], { gasLimit });
         } else {
           // Multi-hop V3 swap
           const { encodePath } = await import("@/lib/v3-utils");
@@ -669,15 +677,33 @@ export default function Swap() {
             amountOutMinimum: minAmountOut,
           };
           
-          const gasEstimate = await swapRouter.exactInput.estimateGas(params);
+          // SwapRouter02 requires multicall for deadline
+          const exactInputData = swapRouter.interface.encodeFunctionData("exactInput", [params]);
+          const multicallData = swapRouter.interface.encodeFunctionData("multicall", [BigInt(deadlineTimestamp), [exactInputData]]);
+          
+          const gasEstimate = await swapRouter.multicall.estimateGas(BigInt(deadlineTimestamp), [exactInputData]);
           const gasLimit = (gasEstimate * 150n) / 100n;
-          tx = await swapRouter.exactInput(params, { gasLimit });
+          tx = await swapRouter.multicall(BigInt(deadlineTimestamp), [exactInputData], { gasLimit });
         }
         
         // Auto-unwrap if output should be native token
         if (toTokenIsNative && wrappedAddress) {
-          // The swap output is wUSDC, need to unwrap to USDC
-          // This happens after the swap completes
+          // Wait for the swap to complete
+          const receipt = await tx.wait();
+          
+          toast({
+            title: "Unwrapping...",
+            description: `Converting w${toToken.symbol} to ${toToken.symbol}`,
+          });
+          
+          // Unwrap the output tokens
+          const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
+          const unwrapGasEstimate = await wrappedContract.withdraw.estimateGas(minAmountOut);
+          const unwrapGasLimit = (unwrapGasEstimate * 150n) / 100n;
+          const unwrapTx = await wrappedContract.withdraw(minAmountOut, { gasLimit: unwrapGasLimit });
+          await unwrapTx.wait();
+          
+          tx = unwrapTx; // For the final toast
         }
       } else {
         // V2 Swap
