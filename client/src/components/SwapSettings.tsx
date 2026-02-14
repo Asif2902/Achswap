@@ -51,6 +51,7 @@ export function SwapSettings({
   const [customRefreshInterval, setCustomRefreshInterval] = useState(quoteRefreshInterval.toString());
 
   const presetSlippages = [0.1, 0.5, 1.0];
+  const autoSlippage = 100; // 100% = auto (no slippage protection)
 
   const bothDisabled = !v2Enabled && !v3Enabled;
 
@@ -142,6 +143,18 @@ export function SwapSettings({
           <div className="space-y-3">
             <Label className="text-sm font-medium text-white">Slippage Tolerance (%)</Label>
             <div className="flex gap-2">
+              {/* Auto button - no slippage protection */}
+              <Button
+                size="sm"
+                variant={slippage === autoSlippage ? "default" : "secondary"}
+                onClick={() => {
+                  onSlippageChange(autoSlippage);
+                  setCustomSlippage("Auto");
+                }}
+                className="flex-1 bg-green-600 hover:bg-green-700"
+              >
+                Auto
+              </Button>
               {presetSlippages.map((preset) => (
                 <Button
                   key={preset}
@@ -165,14 +178,19 @@ export function SwapSettings({
                 onChange={(e) => handleSlippageChange(e.target.value)}
                 className="pr-8 bg-slate-800 border-slate-600 text-white placeholder:text-slate-400"
                 min="0"
-                max="50"
+                max="100"
                 step="0.1"
               />
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-slate-400">
                 %
               </span>
             </div>
-            {slippage > 5 && (
+            {slippage === autoSlippage && (
+              <p className="text-xs text-green-400 bg-green-500/10 p-2 rounded border border-green-500/20">
+                Auto mode: Swap will execute at any price. No slippage protection.
+              </p>
+            )}
+            {slippage > 5 && slippage !== autoSlippage && (
               <p className="text-xs text-orange-400 bg-orange-500/10 p-2 rounded border border-orange-500/20">
                 High slippage tolerance. Your transaction may be frontrun.
               </p>

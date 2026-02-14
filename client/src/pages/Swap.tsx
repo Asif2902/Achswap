@@ -50,7 +50,7 @@ export default function Swap() {
   const [tokens, setTokens] = useState<Token[]>([]);
   const [isSwapping, setIsSwapping] = useState(false);
   const [isLoadingQuote, setIsLoadingQuote] = useState(false);
-  const [slippage, setSlippage] = useState(0.5);
+  const [slippage, setSlippage] = useState(100); // Default to Auto (100% = no slippage protection)
   const [deadline, setDeadline] = useState(20);
   const [recipientAddress, setRecipientAddress] = useState("");
   const [priceImpact, setPriceImpact] = useState<number | null>(null);
@@ -572,7 +572,8 @@ export default function Swap() {
       
       const bestQuote = smartRoutingResult.bestQuote;
       const amountIn = parseAmount(fromAmount, fromToken.decimals);
-      const minAmountOut = (bestQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n;
+      // Auto slippage (100%) = no minimum (0), otherwise calculate based on slippage
+      const minAmountOut = slippage >= 100 ? 0n : (bestQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n;
       const deadlineTimestamp = Math.floor(Date.now() / 1000) + (deadline * 60);
       const recipient = recipientAddress || address;
 
