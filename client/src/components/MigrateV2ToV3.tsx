@@ -9,7 +9,7 @@ import { Contract, BrowserProvider } from "ethers";
 import { getTokensByChainId } from "@/data/tokens";
 import { formatAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
-import { V3_MIGRATOR_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
+import { V3_MIGRATOR_ABI, NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { ArrowRight, AlertCircle, ExternalLink, RefreshCw } from "lucide-react";
 
 const V2_PAIR_ABI = [
@@ -182,72 +182,92 @@ export function MigrateV2ToV3() {
       const signer = await provider.getSigner();
 
       const migrator = new Contract(contracts.v3.migrator, V3_MIGRATOR_ABI, signer);
+      const npm = new Contract(contracts.v3.nonfungiblePositionManager, NONFUNGIBLE_POSITION_MANAGER_ABI, signer);
       const pairContract = new Contract(selectedPosition.pairAddress, V2_PAIR_ABI, signer);
 
       // Calculate liquidity to migrate
       const liquidityToMigrate = (selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n;
 
-      // Calculate expected amounts (with 2% slippage)
-      const amount0 = (selectedPosition.reserve0 * liquidityToMigrate) / selectedPosition.lpBalance;
-      const amount1 = (selectedPosition.reserve1 * liquidityToMigrate) / selectedPosition.lpBalance;
-      const amount0Min = (amount0 * 98n) / 100n;
-      const amount1Min = (amount1 * 98n) / 100n;
+      // Sort tokens by address (required by V3 contracts)
+      const { sortTokens, priceToSqrtPriceX96, getPriceFromAmounts, getFullRangeTicks } = await import("@/lib/v3-utils");
+      const [sortedToken0, sortedToken1] = sortTokens(selectedPosition.token0, selectedPosition.token1);
+      const isOriginalOrder = sortedToken0.address.toLowerCase() === selectedPosition.token0.address.toLowerCase();
+
+      // Use sorted reserves for calculations
+      const reserve0Sorted = isOriginalOrder ? selectedPosition.reserve0 : selectedPosition.reserve1;
+      const reserve1Sorted = isOriginalOrder ? selectedPosition.reserve1 : selectedPosition.reserve0;
+
+      // Calculate expected amounts (with 5% slippage for safety)
+      const amount0 = (reserve0Sorted * liquidityToMigrate) / selectedPosition.lpBalance;
+      const amount1 = (reserve1Sorted * liquidityToMigrate) / selectedPosition.lpBalance;
+      const amount0Min = (amount0 * 95n) / 100n;
+      const amount1Min = (amount1 * 95n) / 100n;
 
       // CRITICAL: Create V3 pool first if it doesn't exist
-      // Calculate price from V2 reserves
-      const { priceToSqrtPriceX96, getPriceFromAmounts } = await import("@/lib/v3-utils");
+      // Calculate price from V2 reserves using sorted tokens
       const price = getPriceFromAmounts(
-        selectedPosition.reserve0, 
-        selectedPosition.reserve1, 
-        selectedPosition.token0.decimals, 
-        selectedPosition.token1.decimals
+        reserve0Sorted,
+        reserve1Sorted,
+        sortedToken0.decimals,
+        sortedToken1.decimals
       );
-      const sqrtPriceX96 = priceToSqrtPriceX96(price, selectedPosition.token0.decimals, selectedPosition.token1.decimals);
+      const sqrtPriceX96 = priceToSqrtPriceX96(price, sortedToken0.decimals, sortedToken1.decimals);
 
       toast({
-        title: "Ensuring V3 pool exists...",
+        title: "Step 1/3: Ensuring V3 pool exists...",
         description: "Creating or verifying V3 pool for migration",
       });
 
+      // Use NonfungiblePositionManager to create pool (not migrator)
       try {
-        const createTx = await migrator.createAndInitializePoolIfNecessary(
-          selectedPosition.token0.address,
-          selectedPosition.token1.address,
+        const createTx = await npm.createAndInitializePoolIfNecessary(
+          sortedToken0.address,
+          sortedToken1.address,
           selectedFee,
           sqrtPriceX96
         );
         await createTx.wait();
+        console.log("V3 pool created/verified successfully");
       } catch (poolError: any) {
-        console.log("Pool creation note:", poolError.message);
+        // Pool may already exist - check if it's a real error
+        const errorMsg = poolError.message || "";
+        if (errorMsg.includes("already initialized") || errorMsg.includes("Pool already exists")) {
+          console.log("Pool already exists, continuing with migration");
+        } else {
+          console.warn("Pool creation warning:", errorMsg);
+          // Try to continue - pool might already exist
+        }
       }
 
-      // Approve LP tokens
+      // Approve LP tokens with max allowance to avoid re-approval
       toast({
-        title: "Approving LP tokens...",
-        description: "Please approve LP token spending",
+        title: "Step 2/3: Approving LP tokens...",
+        description: "Please approve LP token spending in your wallet",
       });
 
       const allowance = await pairContract.allowance(address, contracts.v3.migrator);
       if (allowance < liquidityToMigrate) {
-        const approveTx = await pairContract.approve(contracts.v3.migrator, liquidityToMigrate);
+        // Approve max to avoid future re-approvals
+        const maxApproval = 2n ** 256n - 1n;
+        const approveTx = await pairContract.approve(contracts.v3.migrator, maxApproval);
         await approveTx.wait();
+        console.log("LP token approval confirmed");
       }
 
       // Use full range for safety
-      const { getFullRangeTicks } = await import("@/lib/v3-utils");
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
       toast({
-        title: "Migrating...",
-        description: "Removing V2 liquidity and adding to V3",
+        title: "Step 3/3: Migrating liquidity...",
+        description: "Removing V2 liquidity and adding to V3. Please confirm in your wallet.",
       });
 
       const params = {
         pair: selectedPosition.pairAddress,
         liquidityToMigrate,
         percentageToMigrate: percentToMigrate,
-        token0: selectedPosition.token0.address,
-        token1: selectedPosition.token1.address,
+        token0: sortedToken0.address,
+        token1: sortedToken1.address,
         fee: selectedFee,
         tickLower,
         tickUpper,
@@ -258,10 +278,29 @@ export function MigrateV2ToV3() {
         refundAsETH: false,
       };
 
-      const gasEstimate = await migrator.migrate.estimateGas(params);
-      const gasLimit = (gasEstimate * 150n) / 100n;
-      const tx = await migrator.migrate(params, { gasLimit });
+      console.log("Migration params:", {
+        ...params,
+        liquidityToMigrate: params.liquidityToMigrate.toString(),
+        amount0Min: params.amount0Min.toString(),
+        amount1Min: params.amount1Min.toString(),
+      });
+
+      let tx;
+      try {
+        const gasEstimate = await migrator.migrate.estimateGas(params);
+        const gasLimit = (gasEstimate * 150n) / 100n;
+        tx = await migrator.migrate(params, { gasLimit });
+      } catch (estimateError: any) {
+        console.warn("Gas estimation failed, trying with manual gas limit:", estimateError.message);
+        // If gas estimation fails, try with a generous manual gas limit
+        tx = await migrator.migrate(params, { gasLimit: 1_000_000n });
+      }
+
       const receipt = await tx.wait();
+
+      if (receipt.status === 0) {
+        throw new Error("Transaction reverted on-chain");
+      }
 
       setSelectedPosition(null);
       await loadPositions(); // Reload positions
@@ -284,9 +323,28 @@ export function MigrateV2ToV3() {
       });
     } catch (error: any) {
       console.error("Migration error:", error);
+
+      let errorMessage = "Transaction failed";
+      if (error.reason) {
+        errorMessage = error.reason;
+      } else if (error.message) {
+        // Parse common revert reasons
+        if (error.message.includes("insufficient")) {
+          errorMessage = "Insufficient balance or allowance";
+        } else if (error.message.includes("slippage") || error.message.includes("Price slippage")) {
+          errorMessage = "Price slippage too high. Try increasing slippage tolerance.";
+        } else if (error.message.includes("user rejected") || error.message.includes("denied")) {
+          errorMessage = "Transaction rejected by user";
+        } else if (error.message.includes("TRANSFER_FROM_FAILED")) {
+          errorMessage = "LP token transfer failed. Please check approval.";
+        } else {
+          errorMessage = error.message.substring(0, 200);
+        }
+      }
+
       toast({
         title: "Migration failed",
-        description: error.reason || error.message || "Transaction failed",
+        description: errorMessage,
         variant: "destructive",
       });
     } finally {
