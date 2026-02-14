@@ -620,24 +620,9 @@ export default function Swap() {
           }
         }
         
-        // Build calls for multicall (wrap + swap + unwrap in one transaction)
+        // Build calls for multicall (swap + optional unwrap in one transaction)
         const calls: string[] = [];
-        let totalValue = 0n;
-        
-        // If native token input, add wrap call first
-        if (fromTokenIsNative && wrappedAddress) {
-          const wrapCall = swapRouter.interface.encodeFunctionData("exactInputSingle", [{
-            tokenIn: fromTokenERC20,
-            tokenOut: toTokenERC20,
-            fee: bestQuote.route[0]?.fee || 3000,
-            recipient: recipient,
-            amountIn: amountIn,
-            amountOutMinimum: minAmountOut,
-            sqrtPriceLimitX96: 0n,
-          }]);
-          calls.push(wrapCall);
-          totalValue = amountIn;
-        }
+        let totalValue = fromTokenIsNative ? amountIn : 0n;
         
         // Check if single-hop or multi-hop
         if (bestQuote.route.length === 1) {
