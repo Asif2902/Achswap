@@ -1144,7 +1144,9 @@ export default function Swap() {
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-muted-foreground">Minimum Received</span>
                       <span className="font-medium">
-                        {(parseFloat(toAmount) * (100 - slippage) / 100).toFixed(6)} {toToken.symbol}
+                        {slippage >= 100 
+                          ? "0 (Auto mode)" 
+                          : `${(parseFloat(toAmount) * (100 - slippage) / 100).toFixed(6)} ${toToken.symbol}`}
                       </span>
                     </div>
                     
