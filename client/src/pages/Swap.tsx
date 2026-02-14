@@ -597,35 +597,46 @@ export default function Swap() {
         const fromTokenERC20 = fromTokenIsNative ? wrappedAddress : fromToken.address;
         const toTokenERC20 = toTokenIsNative ? wrappedAddress : toToken.address;
         
-        // Auto-wrap native token if needed
-        if (fromTokenIsNative) {
-          if (!wrappedAddress) throw new Error("No wrapped token configured for native token");
-          
-          toast({
-            title: "Wrapping native token...",
-            description: `Wrapping ${fromToken.symbol} for V3 swap...`,
-          });
-          
-          const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
-          const wrapGasEstimate = await wrappedContract.deposit.estimateGas({ value: amountIn });
-          const wrapGasLimit = (wrapGasEstimate * 150n) / 100n;
-          const wrapTx = await wrappedContract.deposit({ value: amountIn, gasLimit: wrapGasLimit });
-          await wrapTx.wait();
+        // For native token input, we'll batch wrap + swap in multicall
+        // No need for separate wrap transaction
+        if (fromTokenIsNative && !wrappedAddress) {
+          throw new Error("No wrapped token configured for native token");
         }
         
-        // Check and approve token if needed (use ERC20 address)
-        const tokenContract = new Contract(fromTokenERC20, ERC20_ABI, signer);
-        const allowance = await tokenContract.allowance(address, contracts.v3.swapRouter);
+        // Only need separate approval for non-native tokens
+        if (!fromTokenIsNative) {
+          const tokenContract = new Contract(fromTokenERC20, ERC20_ABI, signer);
+          const allowance = await tokenContract.allowance(address, contracts.v3.swapRouter);
+          
+          if (allowance < amountIn) {
+            toast({
+              title: "Approval needed",
+              description: "Approving token for V3 swap...",
+            });
+            const approveGasEstimate = await tokenContract.approve.estimateGas(contracts.v3.swapRouter, amountIn);
+            const approveGasLimit = (approveGasEstimate * 150n) / 100n;
+            const approveTx = await tokenContract.approve(contracts.v3.swapRouter, amountIn, { gasLimit: approveGasLimit });
+            await approveTx.wait();
+          }
+        }
         
-        if (allowance < amountIn) {
-          toast({
-            title: "Approval needed",
-            description: "Approving token for V3 swap...",
-          });
-          const approveGasEstimate = await tokenContract.approve.estimateGas(contracts.v3.swapRouter, amountIn);
-          const approveGasLimit = (approveGasEstimate * 150n) / 100n;
-          const approveTx = await tokenContract.approve(contracts.v3.swapRouter, amountIn, { gasLimit: approveGasLimit });
-          await approveTx.wait();
+        // Build calls for multicall (wrap + swap + unwrap in one transaction)
+        const calls: string[] = [];
+        let totalValue = 0n;
+        
+        // If native token input, add wrap call first
+        if (fromTokenIsNative && wrappedAddress) {
+          const wrapCall = swapRouter.interface.encodeFunctionData("exactInputSingle", [{
+            tokenIn: fromTokenERC20,
+            tokenOut: toTokenERC20,
+            fee: bestQuote.route[0]?.fee || 3000,
+            recipient: recipient,
+            amountIn: amountIn,
+            amountOutMinimum: minAmountOut,
+            sqrtPriceLimitX96: 0n,
+          }]);
+          calls.push(wrapCall);
+          totalValue = amountIn;
         }
         
         // Check if single-hop or multi-hop
@@ -643,17 +654,20 @@ export default function Swap() {
             sqrtPriceLimitX96: 0n,
           };
           
-          // SwapRouter02 requires multicall for deadline
-          // Encode the exactInputSingle call
+          // Use the full function signature to avoid ambiguity
           const exactInputSingleData = swapRouter.interface.encodeFunctionData("exactInputSingle", [params]);
+          calls.push(exactInputSingleData);
           
-          // Encode multicall with deadline
-          const multicallData = swapRouter.interface.encodeFunctionData("multicall", [BigInt(deadlineTimestamp), [exactInputSingleData]]);
+          // If output should be native, add unwrap call
+          if (toTokenIsNative && wrappedAddress) {
+            const unwrapCall = swapRouter.interface.encodeFunctionData("unwrapWETH9", [minAmountOut, recipient]);
+            calls.push(unwrapCall);
+          }
           
-          // Estimate gas for the multicall
-          const gasEstimate = await swapRouter.multicall.estimateGas(BigInt(deadlineTimestamp), [exactInputSingleData]);
+          // Estimate gas for the multicall with deadline
+          const gasEstimate = await swapRouter["multicall(uint256,bytes[])"].estimateGas(BigInt(deadlineTimestamp), calls, { value: totalValue });
           const gasLimit = (gasEstimate * 150n) / 100n;
-          tx = await swapRouter.multicall(BigInt(deadlineTimestamp), [exactInputSingleData], { gasLimit });
+          tx = await swapRouter["multicall(uint256,bytes[])"](BigInt(deadlineTimestamp), calls, { gasLimit, value: totalValue });
         } else {
           // Multi-hop V3 swap
           const { encodePath } = await import("@/lib/v3-utils");
@@ -678,33 +692,19 @@ export default function Swap() {
             amountOutMinimum: minAmountOut,
           };
           
-          // SwapRouter02 requires multicall for deadline
+          // Use the full function signature to avoid ambiguity
           const exactInputData = swapRouter.interface.encodeFunctionData("exactInput", [params]);
-          const multicallData = swapRouter.interface.encodeFunctionData("multicall", [BigInt(deadlineTimestamp), [exactInputData]]);
+          calls.push(exactInputData);
           
-          const gasEstimate = await swapRouter.multicall.estimateGas(BigInt(deadlineTimestamp), [exactInputData]);
+          // If output should be native, add unwrap call
+          if (toTokenIsNative && wrappedAddress) {
+            const unwrapCall = swapRouter.interface.encodeFunctionData("unwrapWETH9", [minAmountOut, recipient]);
+            calls.push(unwrapCall);
+          }
+          
+          const gasEstimate = await swapRouter["multicall(uint256,bytes[])"].estimateGas(BigInt(deadlineTimestamp), calls, { value: totalValue });
           const gasLimit = (gasEstimate * 150n) / 100n;
-          tx = await swapRouter.multicall(BigInt(deadlineTimestamp), [exactInputData], { gasLimit });
-        }
-        
-        // Auto-unwrap if output should be native token
-        if (toTokenIsNative && wrappedAddress) {
-          // Wait for the swap to complete
-          const receipt = await tx.wait();
-          
-          toast({
-            title: "Unwrapping...",
-            description: `Converting w${toToken.symbol} to ${toToken.symbol}`,
-          });
-          
-          // Unwrap the output tokens
-          const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
-          const unwrapGasEstimate = await wrappedContract.withdraw.estimateGas(minAmountOut);
-          const unwrapGasLimit = (unwrapGasEstimate * 150n) / 100n;
-          const unwrapTx = await wrappedContract.withdraw(minAmountOut, { gasLimit: unwrapGasLimit });
-          await unwrapTx.wait();
-          
-          tx = unwrapTx; // For the final toast
+          tx = await swapRouter["multicall(uint256,bytes[])"](BigInt(deadlineTimestamp), calls, { gasLimit, value: totalValue });
         }
       } else {
         // V2 Swap
