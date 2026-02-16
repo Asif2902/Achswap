@@ -632,6 +632,7 @@ export default function Swap() {
             tokenOut: toTokenERC20,
             fee: fee,
             recipient: recipient,
+            deadline: deadlineTimestamp,
             amountIn: amountIn,
             amountOutMinimum: minAmountOut,
             sqrtPriceLimitX96: 0n,
@@ -647,27 +648,10 @@ export default function Swap() {
             calls.push(unwrapCall);
           }
           
-          // Execute multicall with deadline
-          try {
-            // Try with deadline-based multicall first
-            const gasEstimate = await swapRouter.multicall.estimateGas(
-              BigInt(deadlineTimestamp), 
-              calls, 
-              { value: totalValue }
-            );
-            const gasLimit = (gasEstimate * 150n) / 100n;
-            tx = await swapRouter.multicall(
-              BigInt(deadlineTimestamp), 
-              calls, 
-              { gasLimit, value: totalValue }
-            );
-          } catch (multicallError: any) {
-            console.error("Multicall with deadline failed, trying without:", multicallError);
-            // Fallback to multicall without deadline
-            const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
-            const gasLimit = (gasEstimate * 150n) / 100n;
-            tx = await swapRouter.multicall(calls, { gasLimit, value: totalValue });
-          }
+          // Execute multicall (deadline is in the params struct)
+          const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
+          const gasLimit = (gasEstimate * 150n) / 100n;
+          tx = await swapRouter.multicall(calls, { gasLimit, value: totalValue });
         } else {
           // Multi-hop V3 swap
           const { encodePath } = await import("@/lib/v3-utils");
@@ -688,6 +672,7 @@ export default function Swap() {
           const params = {
             path: path,
             recipient: recipient,
+            deadline: deadlineTimestamp,
             amountIn: amountIn,
             amountOutMinimum: minAmountOut,
           };
@@ -702,26 +687,10 @@ export default function Swap() {
             calls.push(unwrapCall);
           }
           
-          try {
-            // Try with deadline-based multicall first
-            const gasEstimate = await swapRouter.multicall.estimateGas(
-              BigInt(deadlineTimestamp), 
-              calls, 
-              { value: totalValue }
-            );
-            const gasLimit = (gasEstimate * 150n) / 100n;
-            tx = await swapRouter.multicall(
-              BigInt(deadlineTimestamp), 
-              calls, 
-              { gasLimit, value: totalValue }
-            );
-          } catch (multicallError: any) {
-            console.error("Multicall with deadline failed, trying without:", multicallError);
-            // Fallback to multicall without deadline
-            const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
-            const gasLimit = (gasEstimate * 150n) / 100n;
-            tx = await swapRouter.multicall(calls, { gasLimit, value: totalValue });
-          }
+          // Execute multicall (deadline is in the params struct)
+          const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
+          const gasLimit = (gasEstimate * 150n) / 100n;
+          tx = await swapRouter.multicall(calls, { gasLimit, value: totalValue });
         }
       } else {
         // V2 Swap

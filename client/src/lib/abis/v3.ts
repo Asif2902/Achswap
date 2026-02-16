@@ -10,21 +10,13 @@ export const QUOTER_V2_ABI = [
 ];
 
 export const SWAP_ROUTER_V3_ABI = [
-  // SwapRouter02 exact input functions (no deadline in struct - use multicall with deadline)
-  "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) external payable returns (uint256 amountOut)",
-  "function exactInput(tuple(bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum) params) external payable returns (uint256 amountOut)",
-  // SwapRouter02 exact output functions
-  "function exactOutputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountOut, uint256 amountInMaximum, uint160 sqrtPriceLimitX96) params) external payable returns (uint256 amountIn)",
-  "function exactOutput(tuple(bytes path, address recipient, uint256 amountOut, uint256 amountInMaximum) params) external payable returns (uint256 amountIn)",
-  // SwapRouter02 multicall variants (deadline-based for transaction expiry)
-  "function multicall(uint256 deadline, bytes[] calldata data) external payable returns (bytes[] memory results)",
-  "function multicall(bytes32 previousBlockhash, bytes[] calldata data) external payable returns (bytes[] memory results)",
+  "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) external payable returns (uint256 amountOut)",
+  "function exactInput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum) params) external payable returns (uint256 amountOut)",
+  "function exactOutputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum, uint160 sqrtPriceLimitX96) params) external payable returns (uint256 amountIn)",
+  "function exactOutput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum) params) external payable returns (uint256 amountIn)",
   "function multicall(bytes[] calldata data) external payable returns (bytes[] memory results)",
-  // Utility functions
   "function refundETH() external payable",
   "function unwrapWETH9(uint256 amountMinimum, address recipient) external payable",
-  "function selfPermit(address token, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external payable",
-  "function sweepToken(address token, uint256 amountMinimum, address recipient) external payable",
 ];
 
 export const NONFUNGIBLE_POSITION_MANAGER_ABI = [

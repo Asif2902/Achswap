@@ -1,4 +1,4 @@
-import { sqrtPriceX96ToPrice, priceToSqrtPriceX96 } from "./v3-utils";
+import { sqrtPriceX96ToPrice, priceToSqrtPriceX96, tickToSqrtPriceX96 } from "./v3-utils";
 
 const Q96 = 2n ** 96n;
 
@@ -18,10 +18,8 @@ export function getAmount1ForAmount0(
   }
   
   if (sqrtPriceX96 >= sqrtPriceUpperX96) {
-    // Price is above range, calculate based on full range
-    const liquidity = (amount0 * sqrtPriceUpperX96 * sqrtPriceLowerX96) / 
-                      ((sqrtPriceUpperX96 - sqrtPriceLowerX96) * Q96);
-    return (liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96)) / Q96;
+    // Price is above range — only token1 needed, token0 can't be deposited
+    return 0n;
   }
   
   // Price is in range
@@ -45,10 +43,8 @@ export function getAmount0ForAmount1(
   }
   
   if (sqrtPriceX96 <= sqrtPriceLowerX96) {
-    // Price is below range, calculate based on full range
-    const liquidity = (amount1 * Q96) / (sqrtPriceUpperX96 - sqrtPriceLowerX96);
-    return (liquidity * Q96 * (sqrtPriceUpperX96 - sqrtPriceLowerX96)) / 
-           (sqrtPriceUpperX96 * sqrtPriceLowerX96);
+    // Price is below range — only token0 needed, token1 can't be deposited
+    return 0n;
   }
   
   // Price is in range
@@ -70,9 +66,9 @@ export function calculateAmountsForLiquidity(
   token0Decimals: number,
   token1Decimals: number
 ): { amount0: bigint; amount1: bigint } {
-  // Calculate sqrt prices for tick bounds
-  const sqrtPriceLowerX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickLower) * Number(Q96)));
-  const sqrtPriceUpperX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickUpper) * Number(Q96)));
+  // Calculate sqrt prices for tick bounds using TickMath (avoids precision loss)
+  const sqrtPriceLowerX96 = tickToSqrtPriceX96(tickLower);
+  const sqrtPriceUpperX96 = tickToSqrtPriceX96(tickUpper);
   
   if (isToken0) {
     const amount1 = getAmount1ForAmount0(
@@ -139,9 +135,9 @@ export function getTokensFromLiquidity(
   tickLower: number,
   tickUpper: number
 ): { amount0: bigint; amount1: bigint } {
-  // Calculate sqrt prices for tick bounds
-  const sqrtPriceLowerX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickLower) * Number(Q96)));
-  const sqrtPriceUpperX96 = BigInt(Math.floor(Math.sqrt(1.0001 ** tickUpper) * Number(Q96)));
+  // Calculate sqrt prices for tick bounds using TickMath (avoids precision loss)
+  const sqrtPriceLowerX96 = tickToSqrtPriceX96(tickLower);
+  const sqrtPriceUpperX96 = tickToSqrtPriceX96(tickUpper);
   
   let amount0: bigint;
   let amount1: bigint;
@@ -159,9 +155,9 @@ export function getTokensFromLiquidity(
     amount1 = (liquidity * (sqrtPriceUpperX96 - sqrtPriceLowerX96)) / Q96;
   } else {
     // Price is in range - both tokens
-    // amount0 = liquidity * (sqrtPriceUpperX96 - currentSqrtPriceX96) / (currentSqrtPriceX96 * sqrtPriceUpperX96)
+    // amount0 = liquidity * Q96 * (sqrtPriceUpperX96 - currentSqrtPriceX96) / (currentSqrtPriceX96 * sqrtPriceUpperX96)
     // amount1 = liquidity * (currentSqrtPriceX96 - sqrtPriceLowerX96) / Q96
-    amount0 = (liquidity * (sqrtPriceUpperX96 - currentSqrtPriceX96)) / 
+    amount0 = (liquidity * Q96 * (sqrtPriceUpperX96 - currentSqrtPriceX96)) / 
               (currentSqrtPriceX96 * sqrtPriceUpperX96);
     amount1 = (liquidity * (currentSqrtPriceX96 - sqrtPriceLowerX96)) / Q96;
   }
