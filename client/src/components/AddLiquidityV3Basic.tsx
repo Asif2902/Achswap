@@ -1,467 +1,622 @@
-import { useEffect, useState } from "react";
+import { useState, useEffect, useMemo } from "react";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Contract, BrowserProvider } from "ethers";
-import { getContractsForChain } from "@/lib/contracts";
-import { NONFUNGIBLE_POSITION_MANAGER_ABI } from "@/lib/abis/v3";
-import { priceToSqrtPriceX96, sortTokens } from "@/lib/v3-utils";
-import { isNativeToken, getWrappedAddress } from "@/data/tokens";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { TokenSelector } from "@/components/TokenSelector";
+import { useAccount, useChainId } from "wagmi";
 import { useToast } from "@/hooks/use-toast";
 import type { Token } from "@shared/schema";
+import { Contract, BrowserProvider, parseUnits } from "ethers";
+import { getTokensByChainId, isNativeToken, getWrappedAddress } from "@/data/tokens";
+import { formatAmount, parseAmount } from "@/lib/decimal-utils";
+import { getContractsForChain } from "@/lib/contracts";
 import {
-  CheckCircle2,
-  XCircle,
-  Wrench,
-  RefreshCw,
-  ExternalLink,
-  Zap,
-  TriangleAlert,
-} from "lucide-react";
+  NONFUNGIBLE_POSITION_MANAGER_ABI,
+  V3_FACTORY_ABI,
+  V3_POOL_ABI,
+  V3_FEE_TIERS,
+  FEE_TIER_LABELS,
+} from "@/lib/abis/v3";
+import {
+  priceToSqrtPriceX96,
+  getWideRangeTicks,
+  sortTokens,
+  getPriceFromAmounts,
+  sqrtPriceX96ToPrice,
+  getFullRangeTicks,
+} from "@/lib/v3-utils";
+import { calculateAmountsForLiquidity } from "@/lib/v3-liquidity-math";
+import { PoolHealthChecker } from "@/components/PoolHealthChecker";
+import type { PoolHealthResult } from "@/components/PoolHealthChecker";
+import { AlertTriangle, Info, Shield, ExternalLink } from "lucide-react";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+const ERC20_ABI = [
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+];
 
-const MAX_TICK = 887272;
-// Flag ticks beyond 50% of max as extreme – catches broken 10% fee pools too
-const TICK_EXTREME_THRESHOLD = Math.floor(MAX_TICK * 0.5); // 443,636
-// Flag price mismatch when pool vs expected differs by more than 50×
-const PRICE_MISMATCH_FACTOR = 50;
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export type PoolIssueKind =
-  | "HEALTHY"
-  | "POOL_NOT_EXIST"
-  | "UNINITIALIZED"
-  | "PRICE_EXTREME"
-  | "PRICE_MISMATCH"
-  | "NO_ACTIVE_LIQUIDITY";
-
-export interface PoolHealthResult {
-  issue: PoolIssueKind;
-  severity: "ok" | "warn" | "error";
-  description: string;
-  suggestedFix: string | null;
-  canAutoFix: boolean;
+function getERC20Address(token: Token, chainId: number): string {
+  if (isNativeToken(token.address)) {
+    const wrapped = getWrappedAddress(chainId, token.address);
+    return wrapped || token.address;
+  }
+  return token.address;
 }
 
-// ─── Props ────────────────────────────────────────────────────────────────────
-// The parent already fetches all pool state – we accept it here to avoid
-// duplicate lookups and the address-resolution bugs that came with them.
+export function AddLiquidityV3Basic() {
+  const [tokenA, setTokenA] = useState<Token | null>(null);
+  const [tokenB, setTokenB] = useState<Token | null>(null);
+  const [amountA, setAmountA] = useState("");
+  const [amountB, setAmountB] = useState("");
+  const [showTokenASelector, setShowTokenASelector] = useState(false);
+  const [showTokenBSelector, setShowTokenBSelector] = useState(false);
+  const [tokens, setTokens] = useState<Token[]>([]);
+  const [selectedFee, setSelectedFee] = useState<number>(V3_FEE_TIERS.MEDIUM);
+  const [isAdding, setIsAdding] = useState(false);
 
-interface PoolHealthCheckerProps {
-  poolAddress: string | null;
-  poolExists: boolean;
-  sqrtPriceX96: bigint | null;
-  currentTick: number | null;
-  currentPrice: number | null;
-  activeLiquidity: bigint | null;
-  token0Symbol: string;
-  token1Symbol: string;
-  // User-entered price ratio (token1/token0, sorted order) for mismatch detection
-  expectedPriceRatio?: number | null;
-  // Needed only for the Initialize Pool fix button
-  tokenA: Token | null;
-  tokenB: Token | null;
-  fee: number;
-  chainId: number;
-  onHealthChange?: (result: PoolHealthResult) => void;
-  /** Called after a successful on-chain fix so the parent can re-fetch */
-  onFixed?: () => void;
-}
+  // ── Pool state – fetched once, passed down to PoolHealthChecker as props ──
+  // This is the single source of truth. The checker never re-fetches anything.
+  const [poolAddress, setPoolAddress]         = useState<string | null>(null);
+  const [poolExists, setPoolExists]           = useState(false);
+  const [isCheckingPool, setIsCheckingPool]   = useState(false);
+  const [currentPrice, setCurrentPrice]       = useState<number | null>(null);
+  const [currentSqrtPriceX96, setCurrentSqrtPriceX96] = useState<bigint | null>(null);
+  const [currentTick, setCurrentTick]         = useState<number | null>(null);
+  const [activeLiquidity, setActiveLiquidity] = useState<bigint | null>(null);
+  // Sorted token symbols for the checker display
+  const [token0Symbol, setToken0Symbol]       = useState<string>("");
+  const [token1Symbol, setToken1Symbol]       = useState<string>("");
 
-// ─── Pure diagnosis function ──────────────────────────────────────────────────
+  // Health result from checker – used to gate the Add button
+  const [poolHealth, setPoolHealth] = useState<PoolHealthResult | null>(null);
 
-function diagnose(
-  poolExists: boolean,
-  sqrtPriceX96: bigint | null,
-  currentTick: number | null,
-  currentPrice: number | null,
-  activeLiquidity: bigint | null,
-  token0Symbol: string,
-  token1Symbol: string,
-  expectedPriceRatio?: number | null
-): PoolHealthResult {
-
-  if (!poolExists) {
-    return {
-      issue: "POOL_NOT_EXIST",
-      severity: "ok",
-      description: "No pool exists yet for this pair and fee tier. It will be created when you add liquidity.",
-      suggestedFix: null,
-      canAutoFix: false,
-    };
-  }
-
-  // Can't read state (RPC error or truly broken contract)
-  if (sqrtPriceX96 === null || currentTick === null) {
-    return {
-      issue: "UNINITIALIZED",
-      severity: "error",
-      description: "Pool contract exists but its state could not be read. It may be uninitialized or the RPC failed.",
-      suggestedFix: "Try refreshing. If the issue persists the pool may need to be re-initialized.",
-      canAutoFix: false,
-    };
-  }
-
-  // sqrtPriceX96 === 0 → contract deployed but initialize() never called
-  if (sqrtPriceX96 === 0n) {
-    return {
-      issue: "UNINITIALIZED",
-      severity: "error",
-      description:
-        "The pool contract exists but was never initialized (sqrtPriceX96 = 0). " +
-        "Neither liquidity additions nor swaps are possible until it is initialized.",
-      suggestedFix:
-        "Enter your desired token amounts above, then click Initialize Pool. " +
-        "The initial price will be derived from your entered amounts.",
-      canAutoFix: true,
-    };
-  }
-
-  // Tick near absolute limits → price is effectively at 0 or ∞
-  if (Math.abs(currentTick) >= TICK_EXTREME_THRESHOLD) {
-    const direction =
-      currentTick > 0
-        ? `${token0Symbol} is massively undervalued vs ${token1Symbol}`
-        : `${token1Symbol} is massively undervalued vs ${token0Symbol}`;
-    return {
-      issue: "PRICE_EXTREME",
-      severity: "error",
-      description:
-        `Pool tick is ${currentTick.toLocaleString()} (absolute limit: ±${MAX_TICK.toLocaleString()}). ` +
-        `${direction}. This usually means the pool was initialized with a wildly wrong price. ` +
-        "You cannot add liquidity or swap until the price is corrected.",
-      suggestedFix:
-        activeLiquidity === 0n
-          ? "1) Add a tiny full-range position (0.001 of each token, Basic Mode). " +
-            "2) Swap from the overvalued token to the undervalued one until price nears market rate. " +
-            "3) Remove the bootstrap position. 4) Add your real amounts."
-          : "Use the Swap tab: swap from the overvalued token into the undervalued one repeatedly " +
-            "until the pool price reaches the correct market rate.",
-      canAutoFix: false,
-    };
-  }
-
-  // Price mismatch – pool price vs user ratio differ significantly
-  if (expectedPriceRatio != null && expectedPriceRatio > 0 && currentPrice != null && currentPrice > 0) {
-    const ratio = currentPrice / expectedPriceRatio;
-    const deviation = Math.max(ratio, 1 / ratio);
-    if (deviation > PRICE_MISMATCH_FACTOR) {
-      return {
-        issue: "PRICE_MISMATCH",
-        severity: "warn",
-        description:
-          `Pool price (${currentPrice.toExponential(3)} ${token1Symbol}/${token0Symbol}) ` +
-          `is ${Math.round(deviation)}× different from your entered ratio ` +
-          `(${expectedPriceRatio.toExponential(3)}). ` +
-          "You will likely provide all liquidity as one token at a very unfavourable rate.",
-        suggestedFix:
-          "Double-check your token amounts. If the pool price itself is wrong, " +
-          "a corrective swap is needed before adding liquidity.",
-        canAutoFix: false,
-      };
-    }
-  }
-
-  // Initialized but no active liquidity at current tick
-  if (activeLiquidity === 0n) {
-    return {
-      issue: "NO_ACTIVE_LIQUIDITY",
-      severity: "warn",
-      description:
-        `Pool is initialized at tick ${currentTick.toLocaleString()} but has zero active liquidity here. ` +
-        "Swaps will fail until someone adds a position covering this tick.",
-      suggestedFix: "You can still add liquidity – Basic Mode automatically covers the current tick.",
-      canAutoFix: false,
-    };
-  }
-
-  return {
-    issue: "HEALTHY",
-    severity: "ok",
-    description:
-      currentPrice != null
-        ? `Pool healthy. Price: ${currentPrice.toFixed(6)} ${token1Symbol} per ${token0Symbol}.`
-        : "Pool is healthy.",
-    suggestedFix: null,
-    canAutoFix: false,
-  };
-}
-
-// ─── Style helpers ────────────────────────────────────────────────────────────
-
-function severityColor(s: PoolHealthResult["severity"]) {
-  if (s === "ok")   return "text-green-400";
-  if (s === "warn") return "text-yellow-400";
-  return "text-red-400";
-}
-
-function severityBg(s: PoolHealthResult["severity"]) {
-  if (s === "ok")   return "bg-green-500/10 border-green-500/20";
-  if (s === "warn") return "bg-yellow-500/10 border-yellow-500/20";
-  return "bg-red-500/10 border-red-500/20";
-}
-
-function SeverityIcon({ s }: { s: PoolHealthResult["severity"] }) {
-  if (s === "ok")   return <CheckCircle2 className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />;
-  if (s === "warn") return <TriangleAlert className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />;
-  return <XCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />;
-}
-
-function issueLabel(issue: PoolIssueKind) {
-  switch (issue) {
-    case "POOL_NOT_EXIST":      return "Pool will be created";
-    case "UNINITIALIZED":       return "⚠ Pool Not Initialized";
-    case "PRICE_EXTREME":       return "🚨 Pool Price is Broken";
-    case "PRICE_MISMATCH":      return "⚠ Pool Price Mismatch";
-    case "NO_ACTIVE_LIQUIDITY": return "ℹ No Active Liquidity";
-    default:                    return "✓ Pool Healthy";
-  }
-}
-
-// ─── Component ────────────────────────────────────────────────────────────────
-
-export function PoolHealthChecker({
-  poolAddress,
-  poolExists,
-  sqrtPriceX96,
-  currentTick,
-  currentPrice,
-  activeLiquidity,
-  token0Symbol,
-  token1Symbol,
-  expectedPriceRatio,
-  tokenA,
-  tokenB,
-  fee,
-  chainId,
-  onHealthChange,
-  onFixed,
-}: PoolHealthCheckerProps) {
-  const [isFixing, setIsFixing] = useState(false);
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
   const { toast } = useToast();
 
-  const health = diagnose(
-    poolExists,
-    sqrtPriceX96,
-    currentTick,
-    currentPrice,
-    activeLiquidity,
-    token0Symbol,
-    token1Symbol,
-    expectedPriceRatio
-  );
+  const contracts = chainId ? getContractsForChain(chainId) : null;
+
+  const feeOptions = [
+    { value: V3_FEE_TIERS.LOWEST,     label: "0.01%", description: "Best for very stable pairs" },
+    { value: V3_FEE_TIERS.LOW,        label: "0.05%", description: "Best for stable pairs" },
+    { value: V3_FEE_TIERS.MEDIUM,     label: "0.3%",  description: "Best for most pairs" },
+    { value: V3_FEE_TIERS.HIGH,       label: "1%",    description: "Best for exotic pairs" },
+    { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%",   description: "Best for very exotic pairs" },
+  ];
+
+  // ── Load tokens ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!chainId) return;
+    const chainTokens = getTokensByChainId(chainId);
+    const imported = localStorage.getItem("importedTokens");
+    const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
+    const chainImportedTokens = importedTokens.filter((t) => t.chainId === chainId);
+    setTokens([...chainTokens, ...chainImportedTokens]);
+  }, [chainId]);
+
+  // ── Import token ───────────────────────────────────────────────────────────
+  const handleImportToken = async (addr: string): Promise<Token | null> => {
+    try {
+      if (!addr || addr.length !== 42 || !addr.startsWith("0x")) {
+        throw new Error("Invalid token address format");
+      }
+      const exists = tokens.find((t) => t.address.toLowerCase() === addr.toLowerCase());
+      if (exists) {
+        toast({ title: "Token already added", description: `${exists.symbol} is already in your token list` });
+        return exists;
+      }
+      const rpcUrl = "https://rpc.testnet.arc.network";
+      const provider = new BrowserProvider({
+        request: async ({ method, params }: any) => {
+          const response = await fetch(rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+          });
+          const data = await response.json();
+          if (data.error) throw new Error(data.error.message);
+          return data.result;
+        },
+      });
+      const ERC20_META_ABI = [
+        "function name() view returns (string)",
+        "function symbol() view returns (string)",
+        "function decimals() view returns (uint8)",
+      ];
+      const contract = new Contract(addr, ERC20_META_ABI, provider);
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Request timed out")), 10000)
+      );
+      const [name, symbol, decimals] = await Promise.race([
+        Promise.all([contract.name(), contract.symbol(), contract.decimals()]),
+        timeout,
+      ]) as [string, string, bigint];
+      if (!chainId) throw new Error("Chain ID not available");
+      const newToken: Token = {
+        address: addr,
+        name,
+        symbol,
+        decimals: Number(decimals),
+        logoURI: "/img/logos/unknown-token.png",
+        verified: false,
+        chainId,
+      };
+      const imported = localStorage.getItem("importedTokens");
+      const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
+      if (!importedTokens.find((t: Token) => t.address.toLowerCase() === addr.toLowerCase())) {
+        importedTokens.push(newToken);
+        localStorage.setItem("importedTokens", JSON.stringify(importedTokens));
+      }
+      setTokens((prev) => [...prev, newToken]);
+      toast({ title: "Token imported", description: `${symbol} has been added to your token list` });
+      return newToken;
+    } catch (error: any) {
+      console.error("Token import error:", error);
+      const msg = error.message.includes("timeout")
+        ? "Request timed out. Please check the address and try again."
+        : error.message.includes("Invalid")
+          ? error.message
+          : "Unable to fetch token data. Please verify the address is correct.";
+      toast({ title: "Import failed", description: msg, variant: "destructive" });
+      return null;
+    }
+  };
+
+  // ── Default tokens ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (tokens.length === 0) return;
+    if (!tokenA) {
+      const usdc = tokens.find((t) => t.symbol === "USDC");
+      if (usdc) setTokenA(usdc);
+    }
+    if (!tokenB) {
+      const achs = tokens.find((t) => t.symbol === "ACHS");
+      if (achs) setTokenB(achs);
+    }
+  }, [tokens, tokenA, tokenB]);
+
+  const needsWrapA = tokenA ? isNativeToken(tokenA.address) : false;
+  const needsWrapB = tokenB ? isNativeToken(tokenB.address) : false;
+  const needsWrapping = needsWrapA || needsWrapB;
+
+  // ── Fetch pool state ───────────────────────────────────────────────────────
+  // Single canonical fetch – result is passed to PoolHealthChecker via props.
+  // We also fetch pool.liquidity() here so the checker can detect empty pools.
+  const fetchPoolState = async () => {
+    if (!tokenA || !tokenB || !contracts || !window.ethereum || !chainId) return;
+
+    setIsCheckingPool(true);
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
+
+      const erc20A = getERC20Address(tokenA, chainId);
+      const erc20B = getERC20Address(tokenB, chainId);
+      const [tok0, tok1] = sortTokens(
+        { ...tokenA, address: erc20A },
+        { ...tokenB, address: erc20B }
+      );
+
+      // Store sorted symbols for the checker
+      setToken0Symbol(tok0.symbol);
+      setToken1Symbol(tok1.symbol);
+
+      const addr = await factory.getPool(tok0.address, tok1.address, selectedFee);
+      const ZERO = "0x0000000000000000000000000000000000000000";
+
+      if (!addr || addr === ZERO) {
+        // Pool doesn't exist yet
+        setPoolAddress(null);
+        setPoolExists(false);
+        setCurrentPrice(null);
+        setCurrentSqrtPriceX96(null);
+        setCurrentTick(null);
+        setActiveLiquidity(null);
+        return;
+      }
+
+      setPoolAddress(addr);
+      setPoolExists(true);
+
+      const pool = new Contract(addr, V3_POOL_ABI, provider);
+
+      // Fetch slot0 + liquidity in parallel
+      const [slot0, liq] = await Promise.all([pool.slot0(), pool.liquidity()]);
+
+      const sqrtPriceX96: bigint = slot0[0];
+      const tick = Number(slot0[1]);
+
+      setCurrentSqrtPriceX96(sqrtPriceX96);
+      setCurrentTick(tick);
+      setActiveLiquidity(liq);
+
+      if (sqrtPriceX96 === 0n) {
+        setCurrentPrice(null);
+      } else {
+        setCurrentPrice(sqrtPriceX96ToPrice(sqrtPriceX96, tok0.decimals, tok1.decimals));
+      }
+    } catch (error) {
+      console.error("Error fetching pool state:", error);
+      setPoolExists(false);
+      setCurrentPrice(null);
+      setCurrentSqrtPriceX96(null);
+      setCurrentTick(null);
+      setActiveLiquidity(null);
+    } finally {
+      setIsCheckingPool(false);
+    }
+  };
 
   useEffect(() => {
-    onHealthChange?.(health);
-  // Intentionally depend on primitive fields to avoid infinite loops
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health.issue, health.severity]);
+    fetchPoolState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenA, tokenB, selectedFee, contracts, chainId]);
 
-  // ── Initialize broken / uninitialized pool ────────────────────────────────
-  const handleInitialize = async () => {
-    if (!tokenA || !tokenB || !window.ethereum) return;
-    if (!expectedPriceRatio || expectedPriceRatio <= 0) {
-      toast({
-        title: "Enter token amounts first",
-        description: "Fill in both amounts above so we can derive the initial price.",
-        variant: "destructive",
-      });
-      return;
-    }
+  // ── Expected price ratio (token1/token0 sorted) ────────────────────────────
+  // Passed to the checker for price-mismatch detection and pool initialisation.
+  const expectedPriceRatio = useMemo(() => {
+    if (!tokenA || !tokenB || !amountA || !amountB || !chainId) return null;
+    const a = parseFloat(amountA);
+    const b = parseFloat(amountB);
+    if (!a || !b || isNaN(a) || isNaN(b)) return null;
 
-    setIsFixing(true);
+    const erc20A = getERC20Address(tokenA, chainId);
+    const erc20B = getERC20Address(tokenB, chainId);
+    const [tok0] = sortTokens(
+      { ...tokenA, address: erc20A },
+      { ...tokenB, address: erc20B }
+    );
+    const isToken0A = erc20A.toLowerCase() === tok0.address.toLowerCase();
+    return isToken0A ? b / a : a / b;
+  }, [tokenA, tokenB, amountA, amountB, chainId]);
+
+  // ── Auto-calculate amountB from pool price ─────────────────────────────────
+  useEffect(() => {
+    if (!currentPrice || !amountA || !tokenA || !tokenB || !chainId) return;
+    const amountAFloat = parseFloat(amountA);
+    if (isNaN(amountAFloat) || amountAFloat <= 0) return;
     try {
-      const contracts = getContractsForChain(chainId);
-      if (!contracts) throw new Error("No contracts for this chain");
+      const [tok0] = sortTokens(
+        { ...tokenA, address: getERC20Address(tokenA, chainId) },
+        { ...tokenB, address: getERC20Address(tokenB, chainId) }
+      );
+      const isToken0A = getERC20Address(tokenA, chainId).toLowerCase() === tok0.address.toLowerCase();
+      const calculated = isToken0A ? amountAFloat * currentPrice : amountAFloat / currentPrice;
+      setAmountB(calculated.toFixed(6));
+    } catch (err) {
+      console.error("Amount calc error:", err);
+    }
+  }, [amountA, currentPrice, tokenA, tokenB, chainId]);
 
+  // ── Add liquidity ──────────────────────────────────────────────────────────
+  const handleAddLiquidity = async () => {
+    if (!tokenA || !tokenB || !amountA || !amountB || !address || !contracts || !window.ethereum || !chainId) return;
+
+    setIsAdding(true);
+    try {
       const provider = new BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
 
-      const getERC20 = (t: Token) => {
-        if (isNativeToken(t.address)) return getWrappedAddress(chainId, t.address) ?? t.address;
-        return t.address;
-      };
-
-      const [tok0, tok1] = sortTokens(
-        { ...tokenA, address: getERC20(tokenA) },
-        { ...tokenB, address: getERC20(tokenB) }
-      );
-
-      const sqrtP = priceToSqrtPriceX96(expectedPriceRatio, tok0.decimals, tok1.decimals);
-
-      const posManager = new Contract(
+      const positionManager = new Contract(
         contracts.v3.nonfungiblePositionManager,
         NONFUNGIBLE_POSITION_MANAGER_ABI,
         signer
       );
 
-      toast({ title: "Initializing pool…", description: "Sending initialization transaction" });
-      const tx = await posManager.createAndInitializePoolIfNecessary(
-        tok0.address, tok1.address, fee, sqrtP
+      const tokenAIsNative = isNativeToken(tokenA.address);
+      const tokenBIsNative = isNativeToken(tokenB.address);
+      const tokenAERC20 = getERC20Address(tokenA, chainId);
+      const tokenBERC20 = getERC20Address(tokenB, chainId);
+
+      const [token0, token1] = sortTokens(
+        { ...tokenA, address: tokenAERC20 },
+        { ...tokenB, address: tokenBERC20 }
       );
-      const receipt = await tx.wait();
+      const isToken0A = tokenAERC20.toLowerCase() === token0.address.toLowerCase();
+
+      const amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
+      const amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
+
+      let nativeAmount = 0n;
+      if (tokenAIsNative) nativeAmount = parseAmount(amountA, tokenA.decimals);
+      else if (tokenBIsNative) nativeAmount = parseAmount(amountB, tokenB.decimals);
+
+      // Create pool if it doesn't exist yet
+      const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
+      const existingPool = await factory.getPool(token0.address, token1.address, selectedFee);
+      const ZERO = "0x0000000000000000000000000000000000000000";
+
+      if (!existingPool || existingPool === ZERO) {
+        const price = getPriceFromAmounts(amount0Desired, amount1Desired, token0.decimals, token1.decimals);
+        const sqrtPriceX96 = priceToSqrtPriceX96(price, token0.decimals, token1.decimals);
+
+        toast({ title: "Creating V3 pool…", description: "Initializing new pool with current price" });
+
+        if (nativeAmount > 0n) {
+          const createData = positionManager.interface.encodeFunctionData(
+            "createAndInitializePoolIfNecessary",
+            [token0.address, token1.address, selectedFee, sqrtPriceX96]
+          );
+          const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
+          const tx = await positionManager.multicall([createData, refundData], { value: nativeAmount });
+          await tx.wait();
+        } else {
+          const tx = await positionManager.createAndInitializePoolIfNecessary(
+            token0.address, token1.address, selectedFee, sqrtPriceX96
+          );
+          await tx.wait();
+        }
+      }
+
+      const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
+
+      toast({ title: "Approving tokens…", description: "Please approve token spending" });
+
+      if (!tokenAIsNative || !isToken0A) {
+        const c = new Contract(token0.address, ERC20_ABI, signer);
+        const allowance = await c.allowance(address, contracts.v3.nonfungiblePositionManager);
+        if (allowance < amount0Desired) {
+          await (await c.approve(contracts.v3.nonfungiblePositionManager, amount0Desired)).wait();
+        }
+      }
+
+      if (!tokenBIsNative || isToken0A) {
+        const c = new Contract(token1.address, ERC20_ABI, signer);
+        const allowance = await c.allowance(address, contracts.v3.nonfungiblePositionManager);
+        if (allowance < amount1Desired) {
+          await (await c.approve(contracts.v3.nonfungiblePositionManager, amount1Desired)).wait();
+        }
+      }
+
+      const amount0Min = (amount0Desired * 98n) / 100n;
+      const amount1Min = (amount1Desired * 98n) / 100n;
+      const deadline = Math.floor(Date.now() / 1000) + 1200;
+
+      toast({ title: "Adding liquidity…", description: "Creating V3 position" });
+
+      const params = {
+        token0: token0.address,
+        token1: token1.address,
+        fee: selectedFee,
+        tickLower,
+        tickUpper,
+        amount0Desired,
+        amount1Desired,
+        amount0Min,
+        amount1Min,
+        recipient: address,
+        deadline,
+      };
+
+      let receipt;
+      if (nativeAmount > 0n) {
+        const mintData   = positionManager.interface.encodeFunctionData("mint", [params]);
+        const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
+        const gasEst  = await positionManager.multicall.estimateGas([mintData, refundData], { value: nativeAmount });
+        const gasLimit = (gasEst * 150n) / 100n;
+        const tx = await positionManager.multicall([mintData, refundData], { value: nativeAmount, gasLimit });
+        receipt = await tx.wait();
+      } else {
+        const gasEst  = await positionManager.mint.estimateGas(params);
+        const gasLimit = (gasEst * 150n) / 100n;
+        const tx = await positionManager.mint(params, { gasLimit });
+        receipt = await tx.wait();
+      }
+
+      setAmountA("");
+      setAmountB("");
+
+      // Refresh pool state after successful add
+      await fetchPoolState();
 
       toast({
-        title: "Pool initialized!",
+        title: "Liquidity added!",
         description: (
           <div className="flex items-center gap-2">
-            <span>Pool is ready – you can now add liquidity.</span>
-            <a
-              href={`${contracts.explorer}${receipt.hash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 underline text-xs"
+            <span>Successfully added V3 liquidity (Basic Mode – Safe Range)</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2"
+              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, "_blank")}
             >
-              <ExternalLink className="h-3 w-3" /> Tx
-            </a>
+              <ExternalLink className="h-3 w-3" />
+            </Button>
           </div>
         ),
       });
-
-      onFixed?.();
-    } catch (err: any) {
-      console.error("Initialize failed:", err);
+    } catch (error: any) {
+      console.error("Add liquidity error:", error);
       toast({
-        title: "Initialization failed",
-        description: err.reason ?? err.message ?? "Transaction failed",
+        title: "Failed to add liquidity",
+        description: error.reason || error.message || "Transaction failed",
         variant: "destructive",
       });
     } finally {
-      setIsFixing(false);
+      setIsAdding(false);
     }
   };
 
-  const handleShowExtremeGuide = () => {
-    toast({
-      title: "How to fix a broken pool price",
-      description: (
-        <div className="space-y-1.5 text-xs leading-relaxed">
-          <p><strong>Step 1:</strong> Add a tiny full-range position (0.001 of each token) in Basic Mode – this gives the pool some liquidity to work with.</p>
-          <p><strong>Step 2:</strong> Go to the Swap tab and swap the overvalued token for the undervalued one. Repeat until price is near market rate.</p>
-          <p><strong>Step 3:</strong> Remove the bootstrap position from Remove Liquidity tab.</p>
-          <p><strong>Step 4:</strong> Add your real liquidity normally.</p>
-        </div>
-      ),
-      duration: 20000,
-    });
+  const addButtonLabel = () => {
+    if (isAdding) return "Adding Liquidity…";
+    if (poolHealth?.severity === "error") return "Fix Pool Issues Before Adding";
+    return "Add V3 Liquidity (Safe Mode)";
   };
 
-  // ── Compact OK banner ─────────────────────────────────────────────────────
-  if (health.severity === "ok") {
-    return (
-      <div className={`flex items-center gap-2 p-3 rounded-lg border text-sm ${severityBg("ok")}`}>
-        <SeverityIcon s="ok" />
-        <span className="text-slate-300">{health.description}</span>
-      </div>
-    );
-  }
-
-  // ── Full diagnostic card ──────────────────────────────────────────────────
   return (
-    <div className={`rounded-lg border p-4 space-y-3 ${severityBg(health.severity)}`}>
-      <div className="flex items-start gap-3">
-        <SeverityIcon s={health.severity} />
-        <div className="flex-1 min-w-0">
-          <div className={`font-semibold text-sm ${severityColor(health.severity)}`}>
-            {issueLabel(health.issue)}
-          </div>
-          <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-            {health.description}
+    <div className="space-y-4">
+      {/* Info Banner */}
+      <div className="flex items-start gap-3 p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+        <Shield className="h-5 w-5 text-blue-400 shrink-0 mt-0.5" />
+        <div className="space-y-1">
+          <h3 className="font-semibold text-blue-400 text-sm">Basic Mode – Safe & Simple</h3>
+          <p className="text-xs text-slate-300">
+            Your liquidity will be placed in a wide price range for safety. Recommended for beginners and provides
+            protection against impermanent loss.
           </p>
         </div>
       </div>
 
-      {/* Debug grid for error states */}
-      {health.severity === "error" && (
-        <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-          {currentTick !== null && (
-            <div className="bg-slate-900/50 rounded p-1.5">
-              <div className="text-slate-500">Current tick</div>
-              <div className={Math.abs(currentTick) >= TICK_EXTREME_THRESHOLD ? "text-red-400" : "text-slate-200"}>
-                {currentTick.toLocaleString()}
-              </div>
+      {/* Token Selection */}
+      <Card className="bg-slate-900 border-slate-700">
+        <CardContent className="p-6 space-y-4">
+          <div className="space-y-2">
+            <Label className="text-sm text-slate-400">Token A</Label>
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                placeholder="0.00"
+                value={amountA}
+                onChange={(e) => setAmountA(e.target.value)}
+                className="flex-1 bg-slate-800 border-slate-600"
+              />
+              <Button variant="outline" onClick={() => setShowTokenASelector(true)} className="min-w-[120px]">
+                {tokenA ? (
+                  <div className="flex items-center gap-2">
+                    {tokenA.logoURI && <img src={tokenA.logoURI} alt={tokenA.symbol} className="w-5 h-5 rounded-full" />}
+                    <span>{tokenA.symbol}</span>
+                  </div>
+                ) : (
+                  <span>Select Token</span>
+                )}
+              </Button>
             </div>
-          )}
-          {sqrtPriceX96 !== null && (
-            <div className="bg-slate-900/50 rounded p-1.5">
-              <div className="text-slate-500">sqrtPriceX96</div>
-              <div className={sqrtPriceX96 === 0n ? "text-red-400" : "text-slate-200"}>
-                {sqrtPriceX96 === 0n
-                  ? "0 ← uninitialized"
-                  : `${sqrtPriceX96.toString().slice(0, 8)}… (${sqrtPriceX96.toString().length}d)`}
-              </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label className="text-sm text-slate-400">Token B</Label>
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                placeholder="0.00"
+                value={amountB}
+                onChange={(e) => setAmountB(e.target.value)}
+                className="flex-1 bg-slate-800 border-slate-600"
+                disabled={poolExists && !!currentPrice}
+              />
+              <Button variant="outline" onClick={() => setShowTokenBSelector(true)} className="min-w-[120px]">
+                {tokenB ? (
+                  <div className="flex items-center gap-2">
+                    {tokenB.logoURI && <img src={tokenB.logoURI} alt={tokenB.symbol} className="w-5 h-5 rounded-full" />}
+                    <span>{tokenB.symbol}</span>
+                  </div>
+                ) : (
+                  <span>Select Token</span>
+                )}
+              </Button>
             </div>
-          )}
-          {activeLiquidity !== null && (
-            <div className="bg-slate-900/50 rounded p-1.5">
-              <div className="text-slate-500">Active liquidity</div>
-              <div className={activeLiquidity === 0n ? "text-yellow-400" : "text-slate-200"}>
-                {activeLiquidity === 0n ? "0 (none)" : activeLiquidity.toString().slice(0, 10) + "…"}
-              </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Fee Tier Selection */}
+      <Card className="bg-slate-900 border-slate-700">
+        <CardContent className="p-6 space-y-3">
+          <Label className="text-sm text-slate-400">Fee Tier</Label>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+            {feeOptions.map((option) => (
+              <Button
+                key={option.value}
+                variant={selectedFee === option.value ? "default" : "outline"}
+                onClick={() => setSelectedFee(option.value)}
+                className="flex flex-col h-auto py-3"
+              >
+                <span className="font-semibold">{option.label}</span>
+                <span className="text-xs opacity-70">{option.description}</span>
+              </Button>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Pool Health Checker ─────────────────────────────────────────────────
+          Receives pre-fetched pool state – no internal fetching, no address
+          resolution. Shows green OK, yellow warnings, or red errors + fixes.  */}
+      {tokenA && tokenB && (
+        <>
+          {isCheckingPool ? (
+            <div className="flex items-center gap-2 p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 text-sm">
+              <div className="h-4 w-4 rounded-full border-2 border-slate-600 border-t-slate-300 animate-spin" />
+              Checking pool…
             </div>
+          ) : (
+            <PoolHealthChecker
+              poolAddress={poolAddress}
+              poolExists={poolExists}
+              sqrtPriceX96={currentSqrtPriceX96}
+              currentTick={currentTick}
+              currentPrice={currentPrice}
+              activeLiquidity={activeLiquidity}
+              token0Symbol={token0Symbol}
+              token1Symbol={token1Symbol}
+              expectedPriceRatio={expectedPriceRatio}
+              tokenA={tokenA}
+              tokenB={tokenB}
+              fee={selectedFee}
+              chainId={chainId}
+              onHealthChange={setPoolHealth}
+              onFixed={fetchPoolState}
+            />
           )}
-          {poolAddress && (
-            <div className="bg-slate-900/50 rounded p-1.5">
-              <div className="text-slate-500">Pool</div>
-              <div className="text-slate-200">{poolAddress.slice(0, 6)}…{poolAddress.slice(-4)}</div>
-            </div>
-          )}
+        </>
+      )}
+
+      {/* Wrapping Notice */}
+      {needsWrapping && tokenA && tokenB && (
+        <div className="flex items-start gap-3 p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
+          <Shield className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <h3 className="font-semibold text-green-400 text-sm">Efficient Native Token Handling</h3>
+            <p className="text-xs text-slate-300">
+              Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped in a single
+              transaction. No manual wrapping needed – saves gas and time!
+            </p>
+          </div>
         </div>
       )}
 
-      {/* Suggested fix */}
-      {health.suggestedFix && (
-        <div className="flex items-start gap-2 text-xs text-slate-400 bg-slate-900/60 rounded p-2">
-          <Wrench className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
-          <span>{health.suggestedFix}</span>
-        </div>
+      {/* Add Liquidity Button */}
+      {isConnected ? (
+        <Button
+          onClick={handleAddLiquidity}
+          disabled={
+            !tokenA ||
+            !tokenB ||
+            !amountA ||
+            !amountB ||
+            isAdding ||
+            parseFloat(amountA) <= 0 ||
+            parseFloat(amountB) <= 0 ||
+            // Block on critical errors (broken price, uninitialized).
+            // Warn states (mismatch, no liquidity) still allow adding.
+            poolHealth?.severity === "error"
+          }
+          className="w-full h-12 text-base font-semibold"
+        >
+          {addButtonLabel()}
+        </Button>
+      ) : (
+        <Button disabled className="w-full h-12">
+          Connect Wallet
+        </Button>
       )}
 
-      {/* Action buttons */}
-      <div className="flex flex-wrap gap-2">
-        {health.issue === "UNINITIALIZED" && (
-          <Button
-            size="sm"
-            className="bg-blue-600 hover:bg-blue-700 text-white"
-            disabled={isFixing || !expectedPriceRatio}
-            onClick={handleInitialize}
-          >
-            {isFixing
-              ? <><RefreshCw className="h-3.5 w-3.5 mr-1.5 animate-spin" />Initializing…</>
-              : <><Zap className="h-3.5 w-3.5 mr-1.5" />Initialize Pool</>
-            }
-          </Button>
-        )}
-
-        {health.issue === "PRICE_EXTREME" && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="border-red-500/50 text-red-400 hover:bg-red-500/10"
-            onClick={handleShowExtremeGuide}
-          >
-            <Wrench className="h-3.5 w-3.5 mr-1.5" />Show Fix Steps
-          </Button>
-        )}
-
-        {poolAddress && (
-          <a
-            href={`https://scan.testnet.arc.network/address/${poolAddress}`}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Button size="sm" variant="ghost" className="text-slate-400">
-              <ExternalLink className="h-3.5 w-3.5 mr-1.5" />View Pool
-            </Button>
-          </a>
-        )}
-      </div>
-
-      {health.issue === "UNINITIALIZED" && !expectedPriceRatio && (
-        <p className="text-xs text-yellow-400/80">
-          ↑ Enter amounts in both token fields above to enable the Initialize button.
-        </p>
-      )}
+      {/* Token Selectors */}
+      <TokenSelector
+        open={showTokenASelector}
+        onClose={() => setShowTokenASelector(false)}
+        onSelect={(token) => { setTokenA(token); setShowTokenASelector(false); }}
+        tokens={tokens}
+        onImport={handleImportToken}
+      />
+      <TokenSelector
+        open={showTokenBSelector}
+        onClose={() => setShowTokenBSelector(false)}
+        onSelect={(token) => { setTokenB(token); setShowTokenBSelector(false); }}
+        tokens={tokens}
+        onImport={handleImportToken}
+      />
     </div>
   );
 }
