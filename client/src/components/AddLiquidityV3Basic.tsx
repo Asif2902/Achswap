@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,6 +14,8 @@ import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { priceToSqrtPriceX96, getWideRangeTicks, sortTokens, getPriceFromAmounts, sqrtPriceX96ToPrice, getFullRangeTicks } from "@/lib/v3-utils";
 import { calculateAmountsForLiquidity } from "@/lib/v3-liquidity-math";
+import { PoolHealthChecker } from "@/components/PoolHealthChecker";
+import type { PoolHealthResult } from "@/components/PoolHealthChecker";
 import { AlertTriangle, Info, Shield, ExternalLink } from "lucide-react";
 
 const ERC20_ABI = [
@@ -48,6 +50,9 @@ export function AddLiquidityV3Basic() {
   const [currentSqrtPriceX96, setCurrentSqrtPriceX96] = useState<bigint | null>(null);
   const [currentTick, setCurrentTick] = useState<number | null>(null);
 
+  // ── Pool health state ──────────────────────────────────────────────────────
+  const [poolHealth, setPoolHealth] = useState<PoolHealthResult | null>(null);
+
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
   const { toast } = useToast();
@@ -56,81 +61,84 @@ export function AddLiquidityV3Basic() {
 
   // Fee tier options
   const feeOptions = [
-    { value: V3_FEE_TIERS.LOWEST, label: "0.01%", description: "Best for very stable pairs" },
-    { value: V3_FEE_TIERS.LOW, label: "0.05%", description: "Best for stable pairs" },
-    { value: V3_FEE_TIERS.MEDIUM, label: "0.3%", description: "Best for most pairs" },
-    { value: V3_FEE_TIERS.HIGH, label: "1%", description: "Best for exotic pairs" },
-    { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%", description: "Best for very exotic pairs" },
+    { value: V3_FEE_TIERS.LOWEST,    label: "0.01%", description: "Best for very stable pairs" },
+    { value: V3_FEE_TIERS.LOW,       label: "0.05%", description: "Best for stable pairs" },
+    { value: V3_FEE_TIERS.MEDIUM,    label: "0.3%",  description: "Best for most pairs" },
+    { value: V3_FEE_TIERS.HIGH,      label: "1%",    description: "Best for exotic pairs" },
+    { value: V3_FEE_TIERS.ULTRA_HIGH,label: "10%",   description: "Best for very exotic pairs" },
   ];
+
+  // ── Derive expected price ratio from user inputs ───────────────────────────
+  // Used by PoolHealthChecker for mismatch detection + auto-fix initialisation
+  const expectedPriceRatio = useMemo(() => {
+    if (!tokenA || !tokenB || !amountA || !amountB || !chainId) return null;
+    const a = parseFloat(amountA);
+    const b = parseFloat(amountB);
+    if (!a || !b || isNaN(a) || isNaN(b)) return null;
+
+    const erc20A = getERC20Address(tokenA, chainId);
+    const erc20B = getERC20Address(tokenB, chainId);
+    const tokenAForPool = { ...tokenA, address: erc20A };
+    const tokenBForPool = { ...tokenB, address: erc20B };
+    const [tok0] = sortTokens(tokenAForPool, tokenBForPool);
+    const isToken0A = erc20A.toLowerCase() === tok0.address.toLowerCase();
+    // V3 pool price is always token1/token0 in sorted order
+    return isToken0A ? b / a : a / b;
+  }, [tokenA, tokenB, amountA, amountB, chainId]);
 
   // Load tokens
   useEffect(() => {
     if (!chainId) return;
     const chainTokens = getTokensByChainId(chainId);
-    
+
     // Load imported tokens from localStorage
-    const imported = localStorage.getItem('importedTokens');
+    const imported = localStorage.getItem("importedTokens");
     const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
-    const chainImportedTokens = importedTokens.filter(t => t.chainId === chainId);
-    
+    const chainImportedTokens = importedTokens.filter((t) => t.chainId === chainId);
+
     setTokens([...chainTokens, ...chainImportedTokens]);
   }, [chainId]);
 
   const handleImportToken = async (address: string): Promise<Token | null> => {
     try {
-      if (!address || address.length !== 42 || !address.startsWith('0x')) {
+      if (!address || address.length !== 42 || !address.startsWith("0x")) {
         throw new Error("Invalid token address format");
       }
 
-      // Check if token already exists
-      const exists = tokens.find(t => t.address.toLowerCase() === address.toLowerCase());
+      const exists = tokens.find((t) => t.address.toLowerCase() === address.toLowerCase());
       if (exists) {
-        toast({
-          title: "Token already added",
-          description: `${exists.symbol} is already in your token list`,
-        });
+        toast({ title: "Token already added", description: `${exists.symbol} is already in your token list` });
         return exists;
       }
 
-      // Use public RPC for token data
-      const rpcUrl = 'https://rpc.testnet.arc.network';
+      const rpcUrl = "https://rpc.testnet.arc.network";
       const provider = new BrowserProvider({
         request: async ({ method, params }: any) => {
           const response = await fetch(rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: 1,
-              method,
-              params,
-            }),
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
           });
           const data = await response.json();
           if (data.error) throw new Error(data.error.message);
           return data.result;
         },
       });
-      
+
       const ERC20_META_ABI = [
         "function name() view returns (string)",
         "function symbol() view returns (string)",
         "function decimals() view returns (uint8)",
       ];
-      
-      const contract = new Contract(address, ERC20_META_ABI, provider);
 
+      const contract = new Contract(address, ERC20_META_ABI, provider);
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("Request timed out")), 10000)
       );
 
       const [name, symbol, decimals] = await Promise.race([
-        Promise.all([
-          contract.name(),
-          contract.symbol(),
-          contract.decimals(),
-        ]),
-        timeout
+        Promise.all([contract.name(), contract.symbol(), contract.decimals()]),
+        timeout,
       ]) as [string, string, bigint];
 
       if (!chainId) throw new Error("Chain ID not available");
@@ -145,40 +153,24 @@ export function AddLiquidityV3Basic() {
         chainId,
       };
 
-      const imported = localStorage.getItem('importedTokens');
+      const imported = localStorage.getItem("importedTokens");
       const importedTokens: Token[] = imported ? JSON.parse(imported) : [];
-
       const alreadyImported = importedTokens.find((t: Token) => t.address.toLowerCase() === address.toLowerCase());
       if (!alreadyImported) {
         importedTokens.push(newToken);
-        localStorage.setItem('importedTokens', JSON.stringify(importedTokens));
+        localStorage.setItem("importedTokens", JSON.stringify(importedTokens));
       }
 
-      setTokens(prev => [...prev, newToken]);
-
-      toast({
-        title: "Token imported",
-        description: `${symbol} has been added to your token list`,
-      });
-
+      setTokens((prev) => [...prev, newToken]);
+      toast({ title: "Token imported", description: `${symbol} has been added to your token list` });
       return newToken;
     } catch (error: any) {
-      console.error('Token import error:', error);
+      console.error("Token import error:", error);
       let errorMessage = "Failed to import token";
-
-      if (error.message.includes("timeout")) {
-        errorMessage = "Request timed out. Please check the address and try again.";
-      } else if (error.message.includes("Invalid")) {
-        errorMessage = error.message;
-      } else {
-        errorMessage = "Unable to fetch token data. Please verify the address is correct.";
-      }
-
-      toast({
-        title: "Import failed",
-        description: errorMessage,
-        variant: "destructive",
-      });
+      if (error.message.includes("timeout")) errorMessage = "Request timed out. Please check the address and try again.";
+      else if (error.message.includes("Invalid")) errorMessage = error.message;
+      else errorMessage = "Unable to fetch token data. Please verify the address is correct.";
+      toast({ title: "Import failed", description: errorMessage, variant: "destructive" });
       return null;
     }
   };
@@ -187,11 +179,11 @@ export function AddLiquidityV3Basic() {
   useEffect(() => {
     if (tokens.length === 0) return;
     if (!tokenA) {
-      const usdc = tokens.find(t => t.symbol === 'USDC');
+      const usdc = tokens.find((t) => t.symbol === "USDC");
       if (usdc) setTokenA(usdc);
     }
     if (!tokenB) {
-      const achs = tokens.find(t => t.symbol === 'ACHS');
+      const achs = tokens.find((t) => t.symbol === "ACHS");
       if (achs) setTokenB(achs);
     }
   }, [tokens, tokenA, tokenB]);
@@ -211,7 +203,6 @@ export function AddLiquidityV3Basic() {
         const provider = new BrowserProvider(window.ethereum);
         const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
 
-        // Use ERC20 addresses for pool lookup (native tokens use their wrapped version)
         const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
         const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
         const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
@@ -220,17 +211,14 @@ export function AddLiquidityV3Basic() {
         if (poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000") {
           setPoolExists(true);
 
-          // Get current price from pool
           const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
           const slot0 = await pool.slot0();
           const sqrtPriceX96 = slot0[0];
           const tick = Number(slot0[1]);
 
-          // Store raw values for calculations
           setCurrentSqrtPriceX96(sqrtPriceX96);
           setCurrentTick(tick);
 
-          // Calculate human-readable price
           const price = sqrtPriceX96ToPrice(sqrtPriceX96, token0.decimals, token1.decimals);
           setCurrentPrice(price);
         } else {
@@ -259,19 +247,15 @@ export function AddLiquidityV3Basic() {
     if (isNaN(amountAFloat) || amountAFloat <= 0) return;
 
     try {
-      // Use ERC20 addresses for sorting (V3 uses wrapped tokens)
       const tokenAForPool = { ...tokenA, address: getERC20Address(tokenA, chainId) };
       const tokenBForPool = { ...tokenB, address: getERC20Address(tokenB, chainId) };
-      const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
+      const [token0] = sortTokens(tokenAForPool, tokenBForPool);
       const isToken0A = tokenAForPool.address.toLowerCase() === token0.address.toLowerCase();
 
-      // For V3, the currentPrice is token1/token0
-      // If user inputs token0 amount, calculate token1: amount1 = amount0 * price
-      // If user inputs token1 amount, calculate token0: amount0 = amount1 / price
-      const calculatedAmountB = isToken0A 
-        ? amountAFloat * currentPrice 
+      const calculatedAmountB = isToken0A
+        ? amountAFloat * currentPrice
         : amountAFloat / currentPrice;
-      
+
       setAmountB(calculatedAmountB.toFixed(6));
     } catch (error) {
       console.error("Error calculating amount:", error);
@@ -292,15 +276,12 @@ export function AddLiquidityV3Basic() {
         signer
       );
 
-      // Check which tokens are native
       const tokenAIsNative = isNativeToken(tokenA.address);
       const tokenBIsNative = isNativeToken(tokenB.address);
 
-      // Get ERC20 addresses for V3 (native tokens use their wrapped version)
       const tokenAERC20 = getERC20Address(tokenA, chainId);
       const tokenBERC20 = getERC20Address(tokenB, chainId);
 
-      // Sort tokens using ERC20 addresses - CRITICAL: V3 requires token0 < token1 by address
       const tokenAForPool = { ...tokenA, address: tokenAERC20 };
       const tokenBForPool = { ...tokenB, address: tokenBERC20 };
       const [token0, token1] = sortTokens(tokenAForPool, tokenBForPool);
@@ -309,8 +290,6 @@ export function AddLiquidityV3Basic() {
       const amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
       const amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
 
-      // Determine native token amount for msg.value
-      // Position Manager will wrap internally - no need to manually wrap!
       let nativeAmount = 0n;
       if (tokenAIsNative) {
         nativeAmount = parseAmount(amountA, tokenA.decimals);
@@ -318,55 +297,35 @@ export function AddLiquidityV3Basic() {
         nativeAmount = parseAmount(amountB, tokenB.decimals);
       }
 
-      // Check if pool exists
       const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
       const poolAddress = await factory.getPool(token0.address, token1.address, selectedFee);
-      const poolExists = poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000";
+      const poolExistsOnChain = poolAddress && poolAddress !== "0x0000000000000000000000000000000000000000";
 
-      if (!poolExists) {
-        // Pool doesn't exist - need to create and initialize
+      if (!poolExistsOnChain) {
         const price = getPriceFromAmounts(amount0Desired, amount1Desired, token0.decimals, token1.decimals);
         const sqrtPriceX96 = priceToSqrtPriceX96(price, token0.decimals, token1.decimals);
 
-        toast({
-          title: "Creating V3 pool...",
-          description: "Initializing new pool with current price",
-        });
+        toast({ title: "Creating V3 pool...", description: "Initializing new pool with current price" });
 
-        // Use multicall for pool creation + refund if native token involved
         if (nativeAmount > 0n) {
           const createData = positionManager.interface.encodeFunctionData("createAndInitializePoolIfNecessary", [
-            token0.address,
-            token1.address,
-            selectedFee,
-            sqrtPriceX96
+            token0.address, token1.address, selectedFee, sqrtPriceX96,
           ]);
           const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
-          
           const tx = await positionManager.multicall([createData, refundData], { value: nativeAmount });
           await tx.wait();
         } else {
           const createTx = await positionManager.createAndInitializePoolIfNecessary(
-            token0.address,
-            token1.address,
-            selectedFee,
-            sqrtPriceX96
+            token0.address, token1.address, selectedFee, sqrtPriceX96
           );
           await createTx.wait();
         }
       }
 
-      // Get ticks - use full range for maximum safety in Basic mode
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
-      // Approve tokens - only for non-native tokens
-      // Native tokens don't need approval - Position Manager handles wrapping internally
-      toast({
-        title: "Approving tokens...",
-        description: "Please approve token spending",
-      });
+      toast({ title: "Approving tokens...", description: "Please approve token spending" });
 
-      // Approve token0 if not native
       if (!tokenAIsNative || !isToken0A) {
         const token0Contract = new Contract(token0.address, ERC20_ABI, signer);
         const allowance0 = await token0Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
@@ -376,7 +335,6 @@ export function AddLiquidityV3Basic() {
         }
       }
 
-      // Approve token1 if not native
       if (!tokenBIsNative || isToken0A) {
         const token1Contract = new Contract(token1.address, ERC20_ABI, signer);
         const allowance1 = await token1Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
@@ -386,15 +344,11 @@ export function AddLiquidityV3Basic() {
         }
       }
 
-      // Mint position with 2% slippage
       const amount0Min = (amount0Desired * 98n) / 100n;
       const amount1Min = (amount1Desired * 98n) / 100n;
-      const deadline = Math.floor(Date.now() / 1000) + 1200; // 20 minutes
+      const deadline = Math.floor(Date.now() / 1000) + 1200;
 
-      toast({
-        title: "Adding liquidity...",
-        description: "Creating V3 position",
-      });
+      toast({ title: "Adding liquidity...", description: "Creating V3 position" });
 
       const params = {
         token0: token0.address,
@@ -410,22 +364,15 @@ export function AddLiquidityV3Basic() {
         deadline,
       };
 
-      // Use multicall for mint + refundETH if native token involved
-      // This is the efficient single-transaction approach!
       let receipt;
       if (nativeAmount > 0n) {
-        // Encode mint call
         const mintData = positionManager.interface.encodeFunctionData("mint", [params]);
-        // Encode refundETH to get back unused native tokens
         const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
-        
-        // Execute both calls in one transaction with native token value
         const gasEstimate = await positionManager.multicall.estimateGas([mintData, refundData], { value: nativeAmount });
         const gasLimit = (gasEstimate * 150n) / 100n;
         const tx = await positionManager.multicall([mintData, refundData], { value: nativeAmount, gasLimit });
         receipt = await tx.wait();
       } else {
-        // No native token - just mint directly
         const gasEstimate = await positionManager.mint.estimateGas(params);
         const gasLimit = (gasEstimate * 150n) / 100n;
         const tx = await positionManager.mint(params, { gasLimit });
@@ -444,7 +391,7 @@ export function AddLiquidityV3Basic() {
               size="sm"
               variant="ghost"
               className="h-6 px-2"
-              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, '_blank')}
+              onClick={() => window.open(`${contracts.explorer}${receipt.hash}`, "_blank")}
             >
               <ExternalLink className="h-3 w-3" />
             </Button>
@@ -463,6 +410,13 @@ export function AddLiquidityV3Basic() {
     }
   };
 
+  // Derive human-readable label for the "Add" button based on health state
+  const addButtonLabel = () => {
+    if (isAdding) return "Adding Liquidity...";
+    if (poolHealth?.severity === "error") return "Fix Pool Issues Before Adding";
+    return "Add V3 Liquidity (Safe Mode)";
+  };
+
   return (
     <div className="space-y-4">
       {/* Info Banner */}
@@ -471,7 +425,8 @@ export function AddLiquidityV3Basic() {
         <div className="space-y-1">
           <h3 className="font-semibold text-blue-400 text-sm">Basic Mode - Safe & Simple</h3>
           <p className="text-xs text-slate-300">
-            Your liquidity will be placed in a wide price range for safety. This mode is recommended for beginners and provides protection against impermanent loss.
+            Your liquidity will be placed in a wide price range for safety. This mode is recommended for beginners and
+            provides protection against impermanent loss.
           </p>
         </div>
       </div>
@@ -558,42 +513,29 @@ export function AddLiquidityV3Basic() {
         </CardContent>
       </Card>
 
-      {/* Pool Status */}
+      {/* ── Pool Health Checker ──────────────────────────────────────────────── */}
+      {/* Replaces the old plain "Pool Status" info box.                          */}
+      {/* Shows green OK, yellow warnings, or red errors with one-click fixes.    */}
       {tokenA && tokenB && (
-        <div className="flex items-start gap-3 p-4 bg-slate-800/50 border border-slate-700 rounded-lg">
-          <Info className="h-5 w-5 text-slate-400 shrink-0 mt-0.5" />
-          <div className="space-y-1 text-sm">
-            {isCheckingPool ? (
-              <p className="text-slate-400">Checking pool...</p>
-            ) : poolExists ? (
-              <>
-                <p className="text-green-400 font-medium">✓ Pool exists</p>
-                {currentPrice && (
-                  <p className="text-slate-400">
-                    Current price: 1 {tokenA.symbol} = {currentPrice.toFixed(6)} {tokenB.symbol}
-                  </p>
-                )}
-                <p className="text-slate-400 text-xs">Your liquidity will be added to existing pool with wide price range</p>
-              </>
-            ) : (
-              <>
-                <p className="text-yellow-400 font-medium">⚠ Pool doesn't exist</p>
-                <p className="text-slate-400 text-xs">A new pool will be created with your initial price ratio</p>
-              </>
-            )}
-          </div>
-        </div>
+        <PoolHealthChecker
+          tokenA={tokenA}
+          tokenB={tokenB}
+          fee={selectedFee}
+          chainId={chainId}
+          expectedPriceRatio={expectedPriceRatio}
+          onHealthChange={setPoolHealth}
+        />
       )}
 
-      {/* Wrapping Notice - Updated for multicall efficiency */}
+      {/* Wrapping Notice */}
       {needsWrapping && tokenA && tokenB && (
         <div className="flex items-start gap-3 p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
           <Shield className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />
           <div className="space-y-1">
             <h3 className="font-semibold text-green-400 text-sm">Efficient Native Token Handling</h3>
             <p className="text-xs text-slate-300">
-              Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped in a single transaction. 
-              No manual wrapping needed - saves gas and time!
+              Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped in a single
+              transaction. No manual wrapping needed - saves gas and time!
             </p>
           </div>
         </div>
@@ -603,10 +545,21 @@ export function AddLiquidityV3Basic() {
       {isConnected ? (
         <Button
           onClick={handleAddLiquidity}
-          disabled={!tokenA || !tokenB || !amountA || !amountB || isAdding || parseFloat(amountA) <= 0 || parseFloat(amountB) <= 0}
+          disabled={
+            !tokenA ||
+            !tokenB ||
+            !amountA ||
+            !amountB ||
+            isAdding ||
+            parseFloat(amountA) <= 0 ||
+            parseFloat(amountB) <= 0 ||
+            // Block adding when pool has a critical error (broken price, uninitialized, etc.)
+            // Yellow "warn" states still allow adding so the user can proceed with caution.
+            poolHealth?.severity === "error"
+          }
           className="w-full h-12 text-base font-semibold"
         >
-          {isAdding ? "Adding Liquidity..." : "Add V3 Liquidity (Safe Mode)"}
+          {addButtonLabel()}
         </Button>
       ) : (
         <Button disabled className="w-full h-12">
