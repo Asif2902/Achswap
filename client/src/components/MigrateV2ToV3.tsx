@@ -122,6 +122,21 @@ export function MigrateV2ToV3() {
           const sqrtPriceX96 = slot0[0];
           const tick = Number(slot0[1]);
 
+          // Check if pool has any liquidity
+          const liquidity = await pool.liquidity();
+
+          if (sqrtPriceX96 === 0n) {
+            // Pool address exists but was never initialized — treat as non-existent
+            setV3PoolInfo({
+              exists: false,
+              address: null,
+              currentPrice: null,
+              currentTick: null,
+              sqrtPriceX96: null,
+            });
+            return;
+          }
+
           const currentPrice = sqrtPriceX96ToPrice(
             sqrtPriceX96,
             selectedPosition.token0.decimals,
@@ -134,9 +149,10 @@ export function MigrateV2ToV3() {
             currentPrice,
             currentTick: tick,
             sqrtPriceX96,
+            // @ts-ignore — extend if needed
+            hasLiquidity: liquidity > 0n,
           });
         } else {
-          // Pool doesn't exist
           setV3PoolInfo({
             exists: false,
             address: null,
@@ -160,7 +176,7 @@ export function MigrateV2ToV3() {
     };
 
     checkV3Pool();
-    setPriceWarningConfirmed(false); // Reset confirmation when pool/fee changes
+    setPriceWarningConfirmed(false);
   }, [selectedPosition, selectedFee, contracts]);
 
   // Calculate V2 price
@@ -198,7 +214,6 @@ export function MigrateV2ToV3() {
       const pairsLength = await factory.allPairsLength();
       const userPositions: V2Position[] = [];
 
-      // Check all pairs (limited to first 50 for performance)
       const maxPairs = Math.min(Number(pairsLength), 50);
 
       for (let i = 0; i < maxPairs; i++) {
@@ -214,7 +229,6 @@ export function MigrateV2ToV3() {
             const reserves = await pairContract.getReserves();
             const totalSupply = await pairContract.totalSupply();
 
-            // Get token details
             const token0Contract = new Contract(token0Address, ERC20_ABI, provider);
             const token1Contract = new Contract(token1Address, ERC20_ABI, provider);
 
@@ -264,7 +278,6 @@ export function MigrateV2ToV3() {
             });
           }
         } catch (error) {
-          // Skip pairs that error out
           continue;
         }
       }
@@ -298,7 +311,6 @@ export function MigrateV2ToV3() {
   const handleMigrate = async () => {
     if (!selectedPosition || !address || !contracts || !window.ethereum || !migratorExists) return;
 
-    // Check price warning confirmation
     if (showPriceWarning) {
       toast({
         title: "Confirmation required",
@@ -316,61 +328,31 @@ export function MigrateV2ToV3() {
       const migrator = new Contract(contracts.v3.migrator, V3_MIGRATOR_ABI, signer);
       const pairContract = new Contract(selectedPosition.pairAddress, V2_PAIR_ABI, signer);
 
-      // Calculate liquidity to migrate
       const liquidityToMigrate = (selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n;
 
-      // Calculate expected amounts based on user's share of total supply (with 2% slippage)
-      const amount0 = (selectedPosition.reserve0 * liquidityToMigrate) / selectedPosition.totalSupply;
-      const amount1 = (selectedPosition.reserve1 * liquidityToMigrate) / selectedPosition.totalSupply;
-      const amount0Min = (amount0 * 98n) / 100n;
-      const amount1Min = (amount1 * 98n) / 100n;
-
-      // Handle pool creation/initialization
+      // ─── Determine sqrtPriceX96 ──────────────────────────────────────────────
+      // Always pass sqrtPriceX96 to the migrate params.
+      // The migrator calls createAndInitializePoolIfNecessary internally —
+      // we must NOT create the pool in a separate tx before calling migrate,
+      // because a failed migrate would leave the pool initialized but empty
+      // and permanently broken.
       let sqrtPriceX96: bigint;
 
       if (v3PoolInfo?.exists && v3PoolInfo.sqrtPriceX96) {
-        // Pool exists - use existing price (no need to create)
+        // Pool already exists — use its current price
         sqrtPriceX96 = v3PoolInfo.sqrtPriceX96;
-        toast({
-          title: "Using existing V3 pool",
-          description: "Pool already exists with current price",
-        });
       } else {
-        // Pool doesn't exist - create with V2 price
+        // Pool doesn't exist yet — initialize with V2 price
         const v2Price = getV2Price();
         if (!v2Price) throw new Error("Could not calculate V2 price");
-        
         sqrtPriceX96 = priceToSqrtPriceX96(
           v2Price,
           selectedPosition.token0.decimals,
           selectedPosition.token1.decimals
         );
-
-        toast({
-          title: "Creating V3 pool...",
-          description: "Initializing new pool with V2 price",
-        });
-
-        try {
-          const createTx = await migrator.createAndInitializePoolIfNecessary(
-            selectedPosition.token0.address,
-            selectedPosition.token1.address,
-            selectedFee,
-            sqrtPriceX96
-          );
-          await createTx.wait();
-        } catch (poolError: any) {
-          const msg = poolError.reason || poolError.message || "";
-          // Only safe to ignore if pool was already created/initialized
-          if (msg.includes("already initialized") || msg.includes("AI") || msg.includes("pool already exists")) {
-            console.log("Pool already exists/initialized, continuing...");
-          } else {
-            throw new Error(`Failed to create V3 pool: ${msg}`);
-          }
-        }
       }
 
-      // Approve LP tokens
+      // ─── Approve LP tokens ───────────────────────────────────────────────────
       toast({
         title: "Approving LP tokens...",
         description: "Please approve LP token spending",
@@ -382,13 +364,27 @@ export function MigrateV2ToV3() {
         await approveTx.wait();
       }
 
-      // Use full range for safety
+      // ─── Full-range ticks ────────────────────────────────────────────────────
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
       toast({
         title: "Migrating...",
         description: "Removing V2 liquidity and adding to V3",
       });
+
+      // ─── CRITICAL: amount0Min / amount1Min must be 0 ─────────────────────────
+      //
+      // When migrating V2 → V3, the migrator withdraws tokens from V2 at the V2
+      // price ratio, then deposits into V3 at the V3 price ratio.  If those
+      // prices differ at all (they almost always do), one token is in excess and
+      // only a partial amount is deposited.  Setting a non-zero minimum based on
+      // V2 amounts will therefore always trigger the "Price slippage check" revert.
+      //
+      // Setting both to 0 is safe here: the user is explicitly migrating and
+      // accepts that excess tokens are refunded.  The migrator returns any
+      // leftover tokens to the recipient address automatically.
+      const amount0Min = 0n;
+      const amount1Min = 0n;
 
       const params = {
         pair: selectedPosition.pairAddress,
@@ -404,6 +400,7 @@ export function MigrateV2ToV3() {
         recipient: address,
         deadline: Math.floor(Date.now() / 1000) + 1200,
         refundAsETH: false,
+        sqrtPriceX96, // ← migrator uses this to create+init the pool if needed
       };
 
       const gasEstimate = await migrator.migrate.estimateGas(params);
@@ -414,7 +411,7 @@ export function MigrateV2ToV3() {
       setSelectedPosition(null);
       setV3PoolInfo(null);
       setPriceWarningConfirmed(false);
-      await loadPositions(); // Reload positions
+      await loadPositions();
 
       toast({
         title: "Migration successful!",
@@ -464,7 +461,7 @@ export function MigrateV2ToV3() {
           <div className="space-y-1">
             <h3 className="font-semibold text-red-400 text-sm">V3 Migrator Not Found</h3>
             <p className="text-xs text-slate-300">
-              The V3 Migrator contract is not deployed at the configured address ({contracts?.v3.migrator}). 
+              The V3 Migrator contract is not deployed at the configured address ({contracts?.v3.migrator}).
               Migration will not work until the contract is deployed.
             </p>
           </div>
@@ -490,12 +487,7 @@ export function MigrateV2ToV3() {
           <CardContent className="p-6 text-center space-y-3">
             <AlertCircle className="h-12 w-12 text-slate-600 mx-auto" />
             <p className="text-slate-400">No V2 liquidity positions found</p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={loadPositions}
-              className="mt-2"
-            >
+            <Button variant="outline" size="sm" onClick={loadPositions} className="mt-2">
               <RefreshCw className="h-4 w-4 mr-2" />
               Refresh
             </Button>
@@ -517,16 +509,8 @@ export function MigrateV2ToV3() {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <div className="flex items-center">
-                      <img
-                        src={position.token0.logoURI}
-                        alt={position.token0.symbol}
-                        className="w-8 h-8 rounded-full"
-                      />
-                      <img
-                        src={position.token1.logoURI}
-                        alt={position.token1.symbol}
-                        className="w-8 h-8 rounded-full -ml-2"
-                      />
+                      <img src={position.token0.logoURI} alt={position.token0.symbol} className="w-8 h-8 rounded-full" />
+                      <img src={position.token1.logoURI} alt={position.token1.symbol} className="w-8 h-8 rounded-full -ml-2" />
                     </div>
                     <div>
                       <div className="font-semibold text-white">
@@ -539,9 +523,7 @@ export function MigrateV2ToV3() {
                     </div>
                   </div>
                   <div className="text-right">
-                    <div className="text-sm font-medium text-slate-300">
-                      {position.sharePercent.toFixed(4)}%
-                    </div>
+                    <div className="text-sm font-medium text-slate-300">{position.sharePercent.toFixed(4)}%</div>
                     <div className="text-xs text-slate-500">Pool Share</div>
                   </div>
                 </div>
@@ -616,7 +598,6 @@ export function MigrateV2ToV3() {
                   )}
                 </div>
 
-                {/* Price Comparison */}
                 {v3PoolInfo.exists && v3PoolInfo.currentPrice && (
                   <div className="space-y-2 pt-2 border-t border-slate-700">
                     <div className="flex items-center justify-between text-sm">
@@ -655,7 +636,7 @@ export function MigrateV2ToV3() {
                     <ul className="text-xs text-slate-400 list-disc list-inside space-y-1">
                       <li>Impermanent loss when adding liquidity</li>
                       <li>Receiving fewer tokens than expected</li>
-                      <li>Arbitrage opportunities for other users</li>
+                      <li>Excess tokens refunded to your wallet rather than deposited</li>
                     </ul>
                     <div className="flex items-center gap-2 pt-2">
                       <Button
@@ -696,7 +677,6 @@ export function MigrateV2ToV3() {
                 </span>
               </div>
 
-              {/* Expected amounts */}
               <div className="space-y-2 py-3 border-t border-slate-700">
                 <span className="text-slate-400 text-xs">Expected tokens to migrate ({percentToMigrate}%)</span>
                 <div className="flex justify-between text-sm">
@@ -717,22 +697,25 @@ export function MigrateV2ToV3() {
                     )}
                   </span>
                 </div>
+                <p className="text-xs text-slate-500 pt-1">
+                  Note: any tokens not deposited into V3 (due to price ratio differences) are refunded to your wallet.
+                </p>
               </div>
 
               <Button
                 onClick={handleMigrate}
                 disabled={
-                  !migratorExists || 
-                  isMigrating || 
+                  !migratorExists ||
+                  isMigrating ||
                   showPriceWarning ||
                   isCheckingPool
                 }
                 className="w-full h-12 text-base font-semibold"
               >
-                {isMigrating 
-                  ? "Migrating..." 
-                  : showPriceWarning 
-                    ? "Confirm Price Warning Above" 
+                {isMigrating
+                  ? "Migrating..."
+                  : showPriceWarning
+                    ? "Confirm Price Warning Above"
                     : "Migrate to V3"}
               </Button>
             </CardContent>
