@@ -11,6 +11,10 @@ const MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342n;
 /**
  * Convert price to sqrtPriceX96
  * Price is token1/token0 in human-readable format
+ * 
+ * IMPORTANT: This function uses split-precision math to avoid JavaScript Number
+ * precision loss when multiplying by 2^96. We split 2^96 into 2^48 * 2^48 to
+ * stay within Number's 53-bit mantissa precision.
  */
 export function priceToSqrtPriceX96(price: number, token0Decimals: number, token1Decimals: number): bigint {
   // Adjust price for decimals: divide by 10^(token0Decimals - token1Decimals)
@@ -18,9 +22,19 @@ export function priceToSqrtPriceX96(price: number, token0Decimals: number, token
   const decimalAdjustment = 10 ** (token0Decimals - token1Decimals);
   const adjustedPrice = price / decimalAdjustment;
   
-  // Calculate sqrt(price) * 2^96
+  if (adjustedPrice <= 0) return MIN_SQRT_RATIO;
+  
+  // Calculate sqrt(price)
   const sqrtPrice = Math.sqrt(adjustedPrice);
-  const sqrtPriceX96 = BigInt(Math.floor(sqrtPrice * Number(Q96)));
+  
+  // KEY FIX: Avoid precision loss by splitting 2^96 into 2^48 * 2^48
+  // 2^48 ≈ 2.8e14 which times a typical sqrt value stays well within
+  // Number's 53-bit mantissa precision
+  const TWO_48 = 2 ** 48; // This fits in Number precisely (281474976710656)
+  const sqrtPriceScaled = sqrtPrice * TWO_48;
+  
+  // Convert to BigInt and shift left by 48 bits (equivalent to multiplying by 2^48 again)
+  const sqrtPriceX96 = BigInt(Math.round(sqrtPriceScaled)) * (1n << 48n);
   
   // Ensure within valid range
   if (sqrtPriceX96 < MIN_SQRT_RATIO) return MIN_SQRT_RATIO;

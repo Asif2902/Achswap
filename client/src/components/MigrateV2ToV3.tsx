@@ -78,6 +78,7 @@ export function MigrateV2ToV3() {
     { value: V3_FEE_TIERS.LOW, label: "0.05%", description: "Stable pairs" },
     { value: V3_FEE_TIERS.MEDIUM, label: "0.3%", description: "Most pairs" },
     { value: V3_FEE_TIERS.HIGH, label: "1%", description: "Exotic pairs" },
+    { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%", description: "Very exotic pairs" },
   ];
 
   // Check if migrator contract exists
@@ -359,8 +360,13 @@ export function MigrateV2ToV3() {
           );
           await createTx.wait();
         } catch (poolError: any) {
-          // Pool might have been created by another transaction
-          console.log("Pool creation note:", poolError.message);
+          const msg = poolError.reason || poolError.message || "";
+          // Only safe to ignore if pool was already created/initialized
+          if (msg.includes("already initialized") || msg.includes("AI") || msg.includes("pool already exists")) {
+            console.log("Pool already exists/initialized, continuing...");
+          } else {
+            throw new Error(`Failed to create V3 pool: ${msg}`);
+          }
         }
       }
 
