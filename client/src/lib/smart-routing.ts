@@ -38,10 +38,12 @@ export interface SmartRoutingResult {
   bestQuote: QuoteResult;
   v2Quote?: QuoteResult;
   v3Quote?: QuoteResult;
+  alternativeQuotes?: QuoteResult[]; // For fallback when best quote fails
+  timestamp: number; // For freshness check
 }
 
 /**
- * Get V2 quote for a swap
+ * Get V2 quote for a swap - tries direct path first, then fallback to wrapped token route
  */
 export async function getV2Quote(
   provider: BrowserProvider,
@@ -54,36 +56,67 @@ export async function getV2Quote(
   try {
     const router = new Contract(routerAddress, V2_ROUTER_ABI, provider);
     
-    // Build path
-    const path = buildV2Path(fromToken, toToken, wrappedTokenAddress);
+    // Try direct path first (most efficient if direct pair exists)
+    const directPath = buildV2Path(fromToken, toToken, wrappedTokenAddress);
     
-    // Get quote
-    const amounts = await router.getAmountsOut(amountIn, path);
-    const outputAmount = amounts[amounts.length - 1];
+    let bestOutputAmount: bigint | null = null;
+    let bestPath: string[] = [];
+    let bestPriceImpact = 0;
     
-    // Calculate price impact
-    const priceImpact = await calculateV2PriceImpact(
-      router,
-      amountIn,
-      outputAmount,
-      path
-    );
+    // Try direct path
+    try {
+      const amounts = await router.getAmountsOut(amountIn, directPath);
+      const outputAmount = amounts[amounts.length - 1];
+      
+      if (outputAmount > 0n) {
+        bestOutputAmount = outputAmount;
+        bestPath = directPath;
+        bestPriceImpact = await calculateV2PriceImpact(router, amountIn, outputAmount, directPath);
+      }
+    } catch (directError) {
+      // Direct path doesn't exist, will try multi-hop
+      console.log("Direct V2 path not available, trying multi-hop through wrapped token");
+    }
+    
+    // Try multi-hop through wrapped token (if different from direct path)
+    const hopPath = buildV2PathWithHop(fromToken, toToken, wrappedTokenAddress);
+    if (hopPath.length !== directPath.length) {
+      try {
+        const amounts = await router.getAmountsOut(amountIn, hopPath);
+        const outputAmount = amounts[amounts.length - 1];
+        
+        // Use this route if it's better than direct path or if direct path failed
+        if (outputAmount > 0n && (bestOutputAmount === null || outputAmount > bestOutputAmount)) {
+          bestOutputAmount = outputAmount;
+          bestPath = hopPath;
+          bestPriceImpact = await calculateV2PriceImpact(router, amountIn, outputAmount, hopPath);
+        }
+      } catch (hopError) {
+        // Multi-hop also failed
+        console.log("Multi-hop V2 path also not available");
+      }
+    }
+    
+    // If no route found, return null
+    if (bestOutputAmount === null || bestPath.length === 0) {
+      return null;
+    }
     
     // Build route hops for visualization
     const route: RouteHop[] = [];
-    for (let i = 0; i < path.length - 1; i++) {
+    for (let i = 0; i < bestPath.length - 1; i++) {
       route.push({
-        tokenIn: i === 0 ? fromToken : getTokenForAddress(path[i], fromToken, toToken, wrappedTokenAddress),
-        tokenOut: i === path.length - 2 ? toToken : getTokenForAddress(path[i + 1], fromToken, toToken, wrappedTokenAddress),
+        tokenIn: i === 0 ? fromToken : getTokenForAddress(bestPath[i], fromToken, toToken, wrappedTokenAddress),
+        tokenOut: i === bestPath.length - 2 ? toToken : getTokenForAddress(bestPath[i + 1], fromToken, toToken, wrappedTokenAddress),
         protocol: "V2",
       });
     }
     
     return {
       protocol: "V2",
-      outputAmount,
+      outputAmount: bestOutputAmount,
       route,
-      priceImpact,
+      priceImpact: bestPriceImpact,
     };
   } catch (error) {
     console.error("V2 quote failed:", error);
@@ -283,9 +316,16 @@ export async function getSmartRouteQuote(
     
     // Choose best quote
     let bestQuote: QuoteResult | null = null;
+    const alternativeQuotes: QuoteResult[] = [];
     
     if (v2Quote && v3Quote) {
-      bestQuote = v2Quote.outputAmount > v3Quote.outputAmount ? v2Quote : v3Quote;
+      if (v2Quote.outputAmount > v3Quote.outputAmount) {
+        bestQuote = v2Quote;
+        alternativeQuotes.push(v3Quote);
+      } else {
+        bestQuote = v3Quote;
+        alternativeQuotes.push(v2Quote);
+      }
     } else if (v2Quote) {
       bestQuote = v2Quote;
     } else if (v3Quote) {
@@ -300,6 +340,8 @@ export async function getSmartRouteQuote(
       bestQuote,
       v2Quote: v2Quote || undefined,
       v3Quote: v3Quote || undefined,
+      alternativeQuotes,
+      timestamp: Date.now(), // Add timestamp for freshness check
     };
   } catch (error) {
     console.error("Smart routing failed:", error);
@@ -308,7 +350,7 @@ export async function getSmartRouteQuote(
 }
 
 /**
- * Build V2 path (with multi-hop through wrapped token if needed)
+ * Build V2 path (try direct path first, then through wrapped token as fallback)
  */
 function buildV2Path(
   fromToken: Token,
@@ -326,7 +368,26 @@ function buildV2Path(
     return [fromAddress, toAddress];
   }
   
-  // Otherwise, route through wrapped token
+  // Try direct path first (most efficient if direct pair exists)
+  // Return direct path - the caller should try this first, then fallback to multi-hop
+  return [fromAddress, toAddress];
+}
+
+/**
+ * Build V2 path with intermediate hop through wrapped token
+ */
+function buildV2PathWithHop(
+  fromToken: Token,
+  toToken: Token,
+  wrappedTokenAddress: string
+): string[] {
+  const isFromNative = fromToken.address === "0x0000000000000000000000000000000000000000";
+  const isToNative = toToken.address === "0x0000000000000000000000000000000000000000";
+  
+  const fromAddress = isFromNative ? wrappedTokenAddress : fromToken.address;
+  const toAddress = isToNative ? wrappedTokenAddress : toToken.address;
+  
+  // Route through wrapped token
   return [fromAddress, wrappedTokenAddress, toAddress];
 }
 

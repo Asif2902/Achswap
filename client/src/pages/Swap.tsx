@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -64,6 +64,10 @@ export default function Swap() {
   const [routeHops, setRouteHops] = useState<RouteHop[]>([]);
   const [v2Enabled, setV2Enabled] = useState(true);
   const [v3Enabled, setV3Enabled] = useState(true);
+  
+  // Abort controller for quote fetching race conditions
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -114,129 +118,159 @@ export default function Swap() {
     }
   }, [tokens, fromToken, toToken, chainId]);
 
-  // Fetch quote when fromAmount, fromToken, or toToken changes
+  // Fetch quote when fromAmount, fromToken, or toToken changes - with debounce and abort
   useEffect(() => {
-    const fetchQuote = async () => {
-      if (!fromToken || !toToken || !fromAmount || parseFloat(fromAmount) <= 0) {
-        setToAmount("");
-        setPriceImpact(null);
-        return;
-      }
-
-      // Handle wrap/unwrap - 1:1 ratio for ARC Testnet
-      const isWrap = fromToken.symbol === 'USDC' && toToken.symbol === 'wUSDC';
-      const isUnwrap = fromToken.symbol === 'wUSDC' && toToken.symbol === 'USDC';
-
-      if (isWrap || isUnwrap) {
-        setToAmount(fromAmount);
-        setPriceImpact(0);
-        setRouteHops([{
-          tokenIn: fromToken,
-          tokenOut: toToken,
-          protocol: "V2",
-        }]);
-        return;
-      }
-
-      if (!window.ethereum || !contracts) return;
-
-      setIsLoadingQuote(true);
-      try {
-        const provider = new BrowserProvider(window.ethereum);
-        
-        // Get wrapped token address for routing
-        const wrappedTokenData = tokens.find(t => t.symbol === 'wUSDC');
-        const wrappedAddress = wrappedTokenData?.address;
-
-        if (!wrappedAddress) {
-          throw new Error('wUSDC token not found');
-        }
-
-        const amountIn = parseAmount(fromAmount, fromToken.decimals);
-        
-        // Check if both protocols are disabled
-        if (!v2Enabled && !v3Enabled) {
-          toast({
-            title: "No protocols enabled",
-            description: "Please enable at least one protocol in settings",
-            variant: "destructive",
-          });
+    // Debounce the quote fetch to avoid race conditions
+    if (debounceTimeoutRef.current) {
+      clearTimeout(debounceTimeoutRef.current);
+    }
+    
+    // Abort any previous fetch
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    debounceTimeoutRef.current = setTimeout(() => {
+      const fetchQuote = async (signal: AbortSignal) => {
+        if (!fromToken || !toToken || !fromAmount || parseFloat(fromAmount) <= 0) {
           setToAmount("");
           setPriceImpact(null);
-          setRouteHops([]);
           return;
         }
 
-        // Check cache first
-        const cachedQuote = getCachedQuote(
-          fromToken.address,
-          toToken.address,
-          fromAmount,
-          v2Enabled,
-          v3Enabled
-        );
+        // Handle wrap/unwrap - 1:1 ratio for ARC Testnet
+        const isWrap = fromToken.symbol === 'USDC' && toToken.symbol === 'wUSDC';
+        const isUnwrap = fromToken.symbol === 'wUSDC' && toToken.symbol === 'USDC';
 
-        let result: SmartRoutingResult | null;
+        if (isWrap || isUnwrap) {
+          setToAmount(fromAmount);
+          setPriceImpact(0);
+          setRouteHops([{
+            tokenIn: fromToken,
+            tokenOut: toToken,
+            protocol: "V2",
+          }]);
+          return;
+        }
 
-        if (cachedQuote) {
-          result = cachedQuote;
-        } else {
-          // Get smart route quote
-          result = await getSmartRouteQuote(
-            provider,
-            contracts.v2.router,
-            contracts.v3.quoter02,
-            fromToken,
-            toToken,
-            amountIn,
-            wrappedAddress,
+        if (!window.ethereum || !contracts) return;
+
+        setIsLoadingQuote(true);
+        try {
+          const provider = new BrowserProvider(window.ethereum);
+          
+          // Get wrapped token address for routing
+          const wrappedTokenData = tokens.find(t => t.symbol === 'wUSDC');
+          const wrappedAddress = wrappedTokenData?.address;
+
+          if (!wrappedAddress) {
+            throw new Error('wUSDC token not found');
+          }
+
+          const amountIn = parseAmount(fromAmount, fromToken.decimals);
+          
+          // Check if both protocols are disabled
+          if (!v2Enabled && !v3Enabled) {
+            toast({
+              title: "No protocols enabled",
+              description: "Please enable at least one protocol in settings",
+              variant: "destructive",
+            });
+            setToAmount("");
+            setPriceImpact(null);
+            setRouteHops([]);
+            return;
+          }
+
+          // Check if aborted
+          if (signal.aborted) return;
+
+          // Check cache first
+          const cachedQuote = getCachedQuote(
+            fromToken.address,
+            toToken.address,
+            fromAmount,
             v2Enabled,
             v3Enabled
           );
 
-          // Cache the result
-          if (result) {
-            setCachedQuote(
-              fromToken.address,
-              toToken.address,
-              fromAmount,
-              v2Enabled,
-              v3Enabled,
-              result
-            );
-          }
-        }
+          let result: SmartRoutingResult | null;
 
-        if (!result || !result.bestQuote) {
+          if (cachedQuote) {
+            result = cachedQuote;
+          } else {
+            // Get smart route quote
+            result = await getSmartRouteQuote(
+              provider,
+              contracts.v2.router,
+              contracts.v3.quoter02,
+              fromToken,
+              toToken,
+              amountIn,
+              wrappedAddress,
+              v2Enabled,
+              v3Enabled
+            );
+
+            // Check if aborted after async call
+            if (signal.aborted) return;
+
+            // Cache the result
+            if (result) {
+              setCachedQuote(
+                fromToken.address,
+                toToken.address,
+                fromAmount,
+                v2Enabled,
+                v3Enabled,
+                result
+              );
+            }
+          }
+
+          if (!result || !result.bestQuote) {
+            setToAmount("");
+            setPriceImpact(null);
+            setRouteHops([]);
+            return;
+          }
+
+          // Update state with best route
+          setSmartRoutingResult(result);
+          const outputAmount = formatAmount(result.bestQuote.outputAmount, toToken.decimals);
+          setToAmount(outputAmount);
+          setPriceImpact(result.bestQuote.priceImpact);
+          setRouteHops(result.bestQuote.route);
+        } catch (error) {
+          // Don't update state if aborted
+          if (signal.aborted) return;
+          
+          console.error('Failed to fetch quote:', error);
           setToAmount("");
           setPriceImpact(null);
           setRouteHops([]);
-          return;
+          setSmartRoutingResult(null);
+        } finally {
+          if (!signal.aborted) {
+            setIsLoadingQuote(false);
+          }
         }
+      };
 
-        // Update state with best route
-        setSmartRoutingResult(result);
-        const outputAmount = formatAmount(result.bestQuote.outputAmount, toToken.decimals);
-        setToAmount(outputAmount);
-        setPriceImpact(result.bestQuote.priceImpact);
-        setRouteHops(result.bestQuote.route);
-      } catch (error) {
-        console.error('Failed to fetch quote:', error);
-        setToAmount("");
-        setPriceImpact(null);
-        setRouteHops([]);
-        setSmartRoutingResult(null);
-      } finally {
-        setIsLoadingQuote(false);
+      // Create new abort controller for this fetch
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      fetchQuote(controller.signal);
+    }, 300); // 300ms debounce
+
+    return () => {
+      if (debounceTimeoutRef.current) {
+        clearTimeout(debounceTimeoutRef.current);
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
     };
-
-    fetchQuote();
-
-    // Set up auto-refresh interval
-    const intervalId = setInterval(fetchQuote, quoteRefreshInterval * 1000);
-
-    return () => clearInterval(intervalId);
   }, [fromAmount, fromToken, toToken, tokens, quoteRefreshInterval, contracts, chainId, v2Enabled, v3Enabled, toast]);
 
   const loadTokens = async () => {
@@ -567,6 +601,20 @@ export default function Swap() {
         throw new Error("No valid quote available");
       }
 
+      // Freshness check - warn if quote is older than 30 seconds
+      const quoteAge = Date.now() - (smartRoutingResult.timestamp || 0);
+      const QUOTE_STALE_THRESHOLD = 30 * 1000; // 30 seconds
+      
+      if (quoteAge > QUOTE_STALE_THRESHOLD) {
+        toast({
+          title: "Stale quote detected",
+          description: "The price may have changed. Please refresh the quote.",
+          variant: "destructive",
+        });
+        setIsSwapping(false);
+        return;
+      }
+
       const provider = new BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
       
@@ -576,6 +624,36 @@ export default function Swap() {
       const minAmountOut = slippage >= 100 ? 0n : (bestQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n;
       const deadlineTimestamp = Math.floor(Date.now() / 1000) + (deadline * 60);
       const recipient = recipientAddress || address;
+
+      // Helper function for retry with exponential backoff
+      const executeWithRetry = async <T,>(
+        fn: () => Promise<T>,
+        maxRetries: number = 2,
+        operationName: string = "operation"
+      ): Promise<T> => {
+        let lastError: Error | null = null;
+        
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          try {
+            return await fn();
+          } catch (error: any) {
+            lastError = error;
+            console.error(`${operationName} attempt ${attempt + 1} failed:`, error.reason || error.message);
+            
+            if (attempt === maxRetries) {
+              throw error;
+            }
+            
+            // Exponential backoff: 500ms, 1000ms
+            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+          }
+        }
+        
+        throw lastError;
+      };
+
+      // Check if we have an alternative route available for fallback
+      const hasAlternativeRoute = smartRoutingResult?.alternativeQuotes && smartRoutingResult.alternativeQuotes.length > 0;
 
       toast({
         title: "Swapping...",
@@ -648,10 +726,54 @@ export default function Swap() {
             calls.push(unwrapCall);
           }
           
-          // Execute multicall (deadline is in the params struct)
-          const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
-          const gasLimit = (gasEstimate * 150n) / 100n;
-          tx = await swapRouter.multicall(calls, { gasLimit, value: totalValue });
+          // Execute multicall with retry
+          try {
+            tx = await executeWithRetry(
+              async () => {
+                const gasEstimate = await swapRouter.multicall.estimateGas(calls, { value: totalValue });
+                const gasLimit = (gasEstimate * 150n) / 100n;
+                return await swapRouter.multicall(calls, { gasLimit, value: totalValue });
+              },
+              2,
+              "V3 swap"
+            );
+          } catch (v3Error: any) {
+            // V3 failed - try fallback to V2 if available
+            console.error('V3 swap failed, attempting fallback:', v3Error.reason || v3Error.message);
+            
+            if (hasAlternativeRoute) {
+              const alternativeQuote = smartRoutingResult.alternativeQuotes!.find(q => q.protocol === "V2");
+              
+              if (alternativeQuote) {
+                toast({
+                  title: "Falling back to V2",
+                  description: "V3 swap failed, trying V2 route instead...",
+                });
+                
+                // Execute V2 swap as fallback
+                tx = await executeV2Swap(
+                  signer,
+                  contracts,
+                  fromToken,
+                  toToken,
+                  alternativeQuote,
+                  amountIn,
+                  slippage >= 100 ? 0n : (alternativeQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n,
+                  deadlineTimestamp,
+                  recipient,
+                  address,
+                  executeWithRetry
+                );
+                
+                // Update bestQuote for transaction receipt
+                Object.assign(bestQuote, alternativeQuote);
+              } else {
+                throw v3Error;
+              }
+            } else {
+              throw v3Error;
+            }
+          }
         } else {
           // Multi-hop V3 swap
           const { encodePath } = await import("@/lib/v3-utils");
