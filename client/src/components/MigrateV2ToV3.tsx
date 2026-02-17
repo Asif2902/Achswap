@@ -13,6 +13,14 @@ import { V3_MIGRATOR_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LA
 import { priceToSqrtPriceX96, sqrtPriceX96ToPrice, getPriceFromAmounts, getFullRangeTicks } from "@/lib/v3-utils";
 import { ArrowRight, AlertCircle, ExternalLink, RefreshCw, CheckCircle2, AlertTriangle } from "lucide-react";
 
+// Ensure the migrator ABI has the functions needed for the multicall path.
+// The V3 Migrator inherits Multicall and PeripheryImmutableState — both are
+// always present on-chain, but older ABI files may omit them.
+const MIGRATOR_EXTRA_ABI = [
+  "function multicall(bytes[] calldata data) external payable returns (bytes[] memory results)",
+  "function createAndInitializePoolIfNecessary(address token0, address token1, uint24 fee, uint160 sqrtPriceX96) external payable returns (address pool)",
+];
+
 const V2_PAIR_ABI = [
   "function token0() external view returns (address)",
   "function token1() external view returns (address)",
@@ -325,34 +333,12 @@ export function MigrateV2ToV3() {
       const provider = new BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
 
-      const migrator = new Contract(contracts.v3.migrator, V3_MIGRATOR_ABI, signer);
+      const migrator = new Contract(contracts.v3.migrator, [...V3_MIGRATOR_ABI, ...MIGRATOR_EXTRA_ABI], signer);
       const pairContract = new Contract(selectedPosition.pairAddress, V2_PAIR_ABI, signer);
 
       const liquidityToMigrate = (selectedPosition.lpBalance * BigInt(percentToMigrate)) / 100n;
 
-      // ─── Determine sqrtPriceX96 ──────────────────────────────────────────────
-      // Always pass sqrtPriceX96 to the migrate params.
-      // The migrator calls createAndInitializePoolIfNecessary internally —
-      // we must NOT create the pool in a separate tx before calling migrate,
-      // because a failed migrate would leave the pool initialized but empty
-      // and permanently broken.
-      let sqrtPriceX96: bigint;
-
-      if (v3PoolInfo?.exists && v3PoolInfo.sqrtPriceX96) {
-        // Pool already exists — use its current price
-        sqrtPriceX96 = v3PoolInfo.sqrtPriceX96;
-      } else {
-        // Pool doesn't exist yet — initialize with V2 price
-        const v2Price = getV2Price();
-        if (!v2Price) throw new Error("Could not calculate V2 price");
-        sqrtPriceX96 = priceToSqrtPriceX96(
-          v2Price,
-          selectedPosition.token0.decimals,
-          selectedPosition.token1.decimals
-        );
-      }
-
-      // ─── Approve LP tokens ───────────────────────────────────────────────────
+      // ─── Approve LP tokens first (separate tx is fine — approval can't break the pool) ──
       toast({
         title: "Approving LP tokens...",
         description: "Please approve LP token spending",
@@ -367,26 +353,16 @@ export function MigrateV2ToV3() {
       // ─── Full-range ticks ────────────────────────────────────────────────────
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
 
-      toast({
-        title: "Migrating...",
-        description: "Removing V2 liquidity and adding to V3",
-      });
-
       // ─── CRITICAL: amount0Min / amount1Min must be 0 ─────────────────────────
-      //
-      // When migrating V2 → V3, the migrator withdraws tokens from V2 at the V2
-      // price ratio, then deposits into V3 at the V3 price ratio.  If those
-      // prices differ at all (they almost always do), one token is in excess and
-      // only a partial amount is deposited.  Setting a non-zero minimum based on
-      // V2 amounts will therefore always trigger the "Price slippage check" revert.
-      //
-      // Setting both to 0 is safe here: the user is explicitly migrating and
-      // accepts that excess tokens are refunded.  The migrator returns any
-      // leftover tokens to the recipient address automatically.
+      // V2 withdraws tokens at the V2 price ratio; V3 deposits at the V3 ratio.
+      // Any excess token is automatically refunded by the migrator — not lost.
+      // A non-zero min based on V2 amounts will always fail the slippage check.
       const amount0Min = 0n;
       const amount1Min = 0n;
+      const deadline = Math.floor(Date.now() / 1000) + 1200;
 
-      const params = {
+      // ─── MigrateParams (standard struct — no sqrtPriceX96 field) ────────────
+      const migrateParams = {
         pair: selectedPosition.pairAddress,
         liquidityToMigrate,
         percentageToMigrate: percentToMigrate,
@@ -398,15 +374,60 @@ export function MigrateV2ToV3() {
         amount0Min,
         amount1Min,
         recipient: address,
-        deadline: Math.floor(Date.now() / 1000) + 1200,
+        deadline,
         refundAsETH: false,
-        sqrtPriceX96, // ← migrator uses this to create+init the pool if needed
       };
 
-      const gasEstimate = await migrator.migrate.estimateGas(params);
-      const gasLimit = (gasEstimate * 150n) / 100n;
-      const tx = await migrator.migrate(params, { gasLimit });
-      const receipt = await tx.wait();
+      let receipt;
+
+      if (v3PoolInfo?.exists) {
+        // ── Pool already exists: call migrate directly ───────────────────────
+        toast({ title: "Migrating...", description: "Removing V2 liquidity and adding to V3" });
+
+        const gasEstimate = await migrator.migrate.estimateGas(migrateParams);
+        const gasLimit = (gasEstimate * 150n) / 100n;
+        const tx = await migrator.migrate(migrateParams, { gasLimit });
+        receipt = await tx.wait();
+      } else {
+        // ── Pool does NOT exist: use multicall to atomically create + migrate ──
+        //
+        // Why multicall?  If we call createAndInitializePoolIfNecessary in one tx
+        // and migrate in a second tx, a failed migrate leaves an initialized-but-
+        // empty pool that is permanently broken and cannot receive liquidity.
+        //
+        // With multicall both calls share one transaction: if migrate reverts,
+        // the pool creation also reverts — nothing is left in a broken state.
+        const v2Price = getV2Price();
+        if (!v2Price) throw new Error("Could not calculate V2 price");
+
+        const sqrtPriceX96 = priceToSqrtPriceX96(
+          v2Price,
+          selectedPosition.token0.decimals,
+          selectedPosition.token1.decimals
+        );
+
+        toast({
+          title: "Creating pool & migrating...",
+          description: "Initializing V3 pool and migrating liquidity in one transaction",
+        });
+
+        const createData = migrator.interface.encodeFunctionData(
+          "createAndInitializePoolIfNecessary",
+          [
+            selectedPosition.token0.address,
+            selectedPosition.token1.address,
+            selectedFee,
+            sqrtPriceX96,
+          ]
+        );
+
+        const migrateData = migrator.interface.encodeFunctionData("migrate", [migrateParams]);
+
+        const gasEstimate = await migrator.multicall.estimateGas([createData, migrateData]);
+        const gasLimit = (gasEstimate * 150n) / 100n;
+        const tx = await migrator.multicall([createData, migrateData], { gasLimit });
+        receipt = await tx.wait();
+      }
 
       setSelectedPosition(null);
       setV3PoolInfo(null);
