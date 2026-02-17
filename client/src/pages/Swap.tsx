@@ -415,8 +415,11 @@ export default function Swap() {
     const temp = fromToken;
     setFromToken(toToken);
     setToToken(temp);
-    setFromAmount(toAmount);
-    setToAmount(fromAmount);
+    // Clear amounts instead of swapping - let user input fresh amount
+    // This avoids the jarring UX of showing a quoted output as input
+    setFromAmount("");
+    setToAmount("");
+    setSmartRoutingResult(null);
   };
 
   const handleWrap = async (amount: string) => {
@@ -494,17 +497,9 @@ export default function Swap() {
         description: `Unwrapping ${amount} ${wrappedSymbol} to ${nativeSymbol}`,
       });
 
-      // Check allowance first
-      const allowance = await wrappedContract.allowance(address, wrappedToken.address);
-
-      // If allowance is insufficient, approve first
-      if (allowance < amountBigInt) {
-        const approveGasEstimate = await wrappedContract.approve.estimateGas(wrappedToken.address, amountBigInt);
-        const approveGasLimit = (approveGasEstimate * 150n) / 100n;
-        const approveTx = await wrappedContract.approve(wrappedToken.address, amountBigInt, { gasLimit: approveGasLimit });
-        await approveTx.wait();
-      }
-
+      // Note: withdraw() burns from caller's balance directly, no approval needed
+      // The previous approval logic was incorrect - it approved wrappedToken to spend from itself
+      
       // Call withdraw with gas buffer
       const gasEstimate = await wrappedContract.withdraw.estimateGas(amountBigInt);
       const gasLimit = (gasEstimate * 150n) / 100n;
@@ -623,7 +618,19 @@ export default function Swap() {
       // Auto slippage (100%) = no minimum (0), otherwise calculate based on slippage
       const minAmountOut = slippage >= 100 ? 0n : (bestQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n;
       const deadlineTimestamp = Math.floor(Date.now() / 1000) + (deadline * 60);
-      const recipient = recipientAddress || address;
+      
+      // Validate and checksum recipient address
+      let recipient: string;
+      if (recipientAddress) {
+        try {
+          // getAddress validates and applies checksum
+          recipient = getAddress(recipientAddress);
+        } catch (e) {
+          throw new Error("Invalid recipient address format. Please check the address and try again.");
+        }
+      } else {
+        recipient = address!;
+      }
 
       // Helper function for retry with exponential backoff
       const executeWithRetry = async <T,>(

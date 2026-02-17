@@ -3,10 +3,31 @@ import type { SmartRoutingResult } from "./smart-routing";
 interface CachedQuote {
   result: SmartRoutingResult;
   timestamp: number;
+  blockNumber?: number; // Track block for invalidation
 }
 
 const quoteCache = new Map<string, CachedQuote>();
-const CACHE_DURATION = 10000; // 10 seconds
+const CACHE_DURATION = 5000; // 5 seconds - reduced from 10s for volatile markets
+
+// Track latest seen block number
+let latestBlockNumber: number | undefined;
+
+/**
+ * Update the latest block number and invalidate stale cache entries
+ * Call this when a new block is detected
+ */
+export function updateBlockNumber(blockNumber: number): void {
+  if (latestBlockNumber !== undefined && blockNumber > latestBlockNumber) {
+    // Invalidate all cache entries from older blocks
+    // Prices may have changed in new blocks
+    for (const [key, cached] of quoteCache.entries()) {
+      if (cached.blockNumber !== undefined && cached.blockNumber < blockNumber) {
+        quoteCache.delete(key);
+      }
+    }
+  }
+  latestBlockNumber = blockNumber;
+}
 
 /**
  * Generate cache key from swap parameters
@@ -42,6 +63,13 @@ export function getCachedQuote(
     return null;
   }
   
+  // Also invalidate if block number has advanced
+  if (cached.blockNumber !== undefined && latestBlockNumber !== undefined && 
+      cached.blockNumber < latestBlockNumber) {
+    quoteCache.delete(key);
+    return null;
+  }
+  
   return cached.result;
 }
 
@@ -54,12 +82,14 @@ export function setCachedQuote(
   amountIn: string,
   v2Enabled: boolean,
   v3Enabled: boolean,
-  result: SmartRoutingResult
+  result: SmartRoutingResult,
+  blockNumber?: number
 ): void {
   const key = getCacheKey(fromTokenAddress, toTokenAddress, amountIn, v2Enabled, v3Enabled);
   quoteCache.set(key, {
     result,
     timestamp: Date.now(),
+    blockNumber,
   });
 }
 
