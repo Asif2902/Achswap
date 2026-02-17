@@ -130,10 +130,12 @@ export async function getV3Quote(
     const quoter = new Contract(quoterAddress, QUOTER_V2_ABI, provider);
     
     const feeTiers = [
-      V3_FEE_TIERS.LOW,
-      V3_FEE_TIERS.MEDIUM,
-      V3_FEE_TIERS.HIGH,
-    ];
+  V3_FEE_TIERS.LOWEST,     // 100
+  V3_FEE_TIERS.LOW,        // 500
+  V3_FEE_TIERS.MEDIUM,     // 3000
+  V3_FEE_TIERS.HIGH,       // 10000
+  V3_FEE_TIERS.ULTRA_HIGH, // 100000
+];
     
     let bestQuote: QuoteResult | null = null;
     
