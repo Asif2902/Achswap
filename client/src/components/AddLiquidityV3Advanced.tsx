@@ -13,20 +13,13 @@ import { formatAmount, parseAmount } from "@/lib/decimal-utils";
 import { getContractsForChain } from "@/lib/contracts";
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, V3_FACTORY_ABI, V3_POOL_ABI, V3_FEE_TIERS, FEE_TIER_LABELS } from "@/lib/abis/v3";
 import { priceToSqrtPriceX96, sqrtPriceX96ToPrice, priceToTick, tickToPrice, getNearestUsableTick, getTickSpacing, sortTokens, isPositionInRange, getFullRangeTicks } from "@/lib/v3-utils";
-import { AlertTriangle, Zap, ExternalLink, TrendingUp, TrendingDown, ArrowDownUp, Info, Calculator, Settings, BarChart3 } from "lucide-react";
+import { AlertTriangle, Zap, ExternalLink, TrendingUp, TrendingDown, Info, Calculator, Settings, BarChart3, Shield } from "lucide-react";
 import { PriceRangeChart } from "./PriceRangeChart";
 
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
   "function balanceOf(address owner) view returns (uint256)",
-];
-
-const WRAPPED_TOKEN_ABI = [
-  "function deposit() payable",
-  "function withdraw(uint256 amount) returns (bool)",
-  "function approve(address spender, uint256 amount) returns (bool)",
-  "function allowance(address owner, address spender) view returns (uint256)",
 ];
 
 /**
@@ -431,44 +424,13 @@ export function AddLiquidityV3Advanced() {
         signer
       );
 
-      // CRITICAL: V3 only works with ERC20 tokens - wrap native tokens first
+      // Check which tokens are native
       const tokenAIsNative = isNativeToken(tokenA.address);
       const tokenBIsNative = isNativeToken(tokenB.address);
 
       // Get ERC20 addresses for V3 (native tokens use their wrapped version)
       const tokenAERC20 = getERC20Address(tokenA, chainId);
       const tokenBERC20 = getERC20Address(tokenB, chainId);
-
-      // Wrap native tokens if needed
-      if (tokenAIsNative) {
-        const wrappedAddress = getWrappedAddress(chainId, tokenA.address);
-        if (!wrappedAddress) throw new Error("No wrapped token found for native token");
-        
-        toast({
-          title: "Wrapping native token...",
-          description: `Wrapping ${tokenA.symbol} to w${tokenA.symbol}`,
-        });
-
-        const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
-        const wrapAmount = parseAmount(amountA, tokenA.decimals);
-        const wrapTx = await wrappedContract.deposit({ value: wrapAmount });
-        await wrapTx.wait();
-      }
-
-      if (tokenBIsNative) {
-        const wrappedAddress = getWrappedAddress(chainId, tokenB.address);
-        if (!wrappedAddress) throw new Error("No wrapped token found for native token");
-        
-        toast({
-          title: "Wrapping native token...",
-          description: `Wrapping ${tokenB.symbol} to w${tokenB.symbol}`,
-        });
-
-        const wrappedContract = new Contract(wrappedAddress, WRAPPED_TOKEN_ABI, signer);
-        const wrapAmount = parseAmount(amountB, tokenB.decimals);
-        const wrapTx = await wrappedContract.deposit({ value: wrapAmount });
-        await wrapTx.wait();
-      }
 
       // Sort tokens using ERC20 addresses
       const tokenAForPool = { ...tokenA, address: tokenAERC20 };
@@ -478,6 +440,15 @@ export function AddLiquidityV3Advanced() {
 
       const amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
       const amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
+
+      // Determine native token amount for msg.value
+      // Position Manager will wrap internally - no need to manually wrap!
+      let nativeAmount = 0n;
+      if (tokenAIsNative) {
+        nativeAmount = parseAmount(amountA, tokenA.decimals);
+      } else if (tokenBIsNative) {
+        nativeAmount = parseAmount(amountB, tokenB.decimals);
+      }
 
       // Convert prices to ticks
       const tickSpacing = getTickSpacing(selectedFee);
@@ -508,34 +479,54 @@ export function AddLiquidityV3Advanced() {
           description: "Initializing new V3 pool",
         });
 
-        const createTx = await positionManager.createAndInitializePoolIfNecessary(
-          token0.address,
-          token1.address,
-          selectedFee,
-          sqrtPriceX96
-        );
-        await createTx.wait();
+        // Use multicall for pool creation + refund if native token involved
+        if (nativeAmount > 0n) {
+          const createData = positionManager.interface.encodeFunctionData("createAndInitializePoolIfNecessary", [
+            token0.address,
+            token1.address,
+            selectedFee,
+            sqrtPriceX96
+          ]);
+          const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
+          
+          const tx = await positionManager.multicall([createData, refundData], { value: nativeAmount });
+          await tx.wait();
+        } else {
+          const createTx = await positionManager.createAndInitializePoolIfNecessary(
+            token0.address,
+            token1.address,
+            selectedFee,
+            sqrtPriceX96
+          );
+          await createTx.wait();
+        }
       }
 
-      // Approve tokens (using ERC20 addresses)
+      // Approve tokens - only for non-native tokens
+      // Native tokens don't need approval - Position Manager handles wrapping internally
       toast({
         title: "Approving tokens...",
         description: "Please approve token spending",
       });
 
-      const token0Contract = new Contract(token0.address, ERC20_ABI, signer);
-      const token1Contract = new Contract(token1.address, ERC20_ABI, signer);
-
-      const allowance0 = await token0Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
-      if (allowance0 < amount0Desired) {
-        const approveTx = await token0Contract.approve(contracts.v3.nonfungiblePositionManager, amount0Desired);
-        await approveTx.wait();
+      // Approve token0 if not native
+      if (!tokenAIsNative || !isToken0A) {
+        const token0Contract = new Contract(token0.address, ERC20_ABI, signer);
+        const allowance0 = await token0Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
+        if (allowance0 < amount0Desired) {
+          const approveTx = await token0Contract.approve(contracts.v3.nonfungiblePositionManager, amount0Desired);
+          await approveTx.wait();
+        }
       }
 
-      const allowance1 = await token1Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
-      if (allowance1 < amount1Desired) {
-        const approveTx = await token1Contract.approve(contracts.v3.nonfungiblePositionManager, amount1Desired);
-        await approveTx.wait();
+      // Approve token1 if not native
+      if (!tokenBIsNative || isToken0A) {
+        const token1Contract = new Contract(token1.address, ERC20_ABI, signer);
+        const allowance1 = await token1Contract.allowance(address, contracts.v3.nonfungiblePositionManager);
+        if (allowance1 < amount1Desired) {
+          const approveTx = await token1Contract.approve(contracts.v3.nonfungiblePositionManager, amount1Desired);
+          await approveTx.wait();
+        }
       }
 
       // Calculate slippage-protected minimums
@@ -564,10 +555,27 @@ export function AddLiquidityV3Advanced() {
         deadline,
       };
 
-      const gasEstimate = await positionManager.mint.estimateGas(params);
-      const gasLimit = (gasEstimate * 150n) / 100n;
-      const tx = await positionManager.mint(params, { gasLimit });
-      const receipt = await tx.wait();
+      // Use multicall for mint + refundETH if native token involved
+      // This is the efficient single-transaction approach!
+      let receipt;
+      if (nativeAmount > 0n) {
+        // Encode mint call
+        const mintData = positionManager.interface.encodeFunctionData("mint", [params]);
+        // Encode refundETH to get back unused native tokens
+        const refundData = positionManager.interface.encodeFunctionData("refundETH", []);
+        
+        // Execute both calls in one transaction with native token value
+        const gasEstimate = await positionManager.multicall.estimateGas([mintData, refundData], { value: nativeAmount });
+        const gasLimit = (gasEstimate * 150n) / 100n;
+        const tx = await positionManager.multicall([mintData, refundData], { value: nativeAmount, gasLimit });
+        receipt = await tx.wait();
+      } else {
+        // No native token - just mint directly
+        const gasEstimate = await positionManager.mint.estimateGas(params);
+        const gasLimit = (gasEstimate * 150n) / 100n;
+        const tx = await positionManager.mint(params, { gasLimit });
+        receipt = await tx.wait();
+      }
 
       setAmountA("");
       setAmountB("");
@@ -892,14 +900,15 @@ export function AddLiquidityV3Advanced() {
         </CardContent>
       </Card>
 
-      {/* Wrapping Notice */}
+      {/* Wrapping Notice - Updated for multicall efficiency */}
       {needsWrapping && tokenA && tokenB && (
-        <div className="flex items-start gap-3 p-4 bg-orange-500/10 border border-orange-500/20 rounded-lg">
-          <ArrowDownUp className="h-5 w-5 text-orange-400 shrink-0 mt-0.5" />
+        <div className="flex items-start gap-3 p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
+          <Shield className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />
           <div className="space-y-1">
-            <h3 className="font-semibold text-orange-400 text-sm">Auto-Wrapping Required</h3>
+            <h3 className="font-semibold text-green-400 text-sm">Efficient Native Token Handling</h3>
             <p className="text-xs text-slate-300">
-              V3 pools require ERC20 tokens. Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped to {needsWrapA ? `w${tokenA.symbol}` : `w${tokenB.symbol}`} before adding liquidity.
+              Your native {needsWrapA ? tokenA.symbol : tokenB.symbol} will be automatically wrapped in a single transaction. 
+              No manual wrapping needed - saves gas and time!
             </p>
           </div>
         </div>

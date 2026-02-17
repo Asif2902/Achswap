@@ -43,6 +43,10 @@ export const NONFUNGIBLE_POSITION_MANAGER_ABI = [
   "function tokenByIndex(uint256 index) external view returns (uint256)",
   // Multicall for batching operations
   "function multicall(bytes[] calldata data) external payable returns (bytes[] memory results)",
+  // Refund unused ETH/native token
+  "function refundETH() external payable",
+  // Unwrap WETH to ETH
+  "function unwrapWETH9(uint256 amountMinimum, address recipient) external payable",
   // Permit
   "function selfPermit(address token, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external payable",
   // Events
