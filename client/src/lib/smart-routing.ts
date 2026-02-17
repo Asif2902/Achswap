@@ -238,7 +238,14 @@ export async function getV3Quote(
             const gasEstimate = result[3];
             
             if (!bestQuote || outputAmount > bestQuote.outputAmount) {
-              const priceImpact = 0;
+              // Calculate price impact for multi-hop route
+              const priceImpact = await calculateV3MultiHopPriceImpact(
+                quoter,
+                [fromTokenERC20, wrappedTokenAddress, toTokenERC20],
+                [fee1, fee2],
+                amountIn,
+                outputAmount
+              );
               
               bestQuote = {
                 protocol: "V3",
@@ -426,7 +433,7 @@ async function calculateV2PriceImpact(
 }
 
 /**
- * Calculate V3 price impact
+ * Calculate V3 price impact for single-hop
  */
 async function calculateV3PriceImpact(
   quoter: Contract,
@@ -465,6 +472,44 @@ async function calculateV3PriceImpact(
     return 0;
   } catch (error) {
     console.error("V3 price impact calculation failed:", error);
+    return 0;
+  }
+}
+
+/**
+ * Calculate V3 price impact for multi-hop routes
+ */
+async function calculateV3MultiHopPriceImpact(
+  quoter: Contract,
+  path: string,
+  fees: number[],
+  amountIn: bigint,
+  outputAmount: bigint
+): Promise<number> {
+  try {
+    const halfAmountBigInt = amountIn / 2n;
+    
+    if (halfAmountBigInt > 0n) {
+      const { encodePath } = await import("./v3-utils");
+      const encodedPath = encodePath(path, fees);
+      
+      const result = await quoter.quoteExactInput.staticCall(encodedPath, halfAmountBigInt);
+      const halfAmountOutput = result[0];
+      
+      const expectedOutput = halfAmountOutput * 2n;
+      
+      if (expectedOutput > 0n && outputAmount > 0n) {
+        const impactBasisPoints = expectedOutput > outputAmount
+          ? ((expectedOutput - outputAmount) * 10000n) / expectedOutput
+          : ((outputAmount - expectedOutput) * 10000n) / expectedOutput;
+        
+        return Math.max(0, Math.abs(Number(impactBasisPoints) / 100));
+      }
+    }
+    
+    return 0;
+  } catch (error) {
+    console.error("V3 multi-hop price impact calculation failed:", error);
     return 0;
   }
 }

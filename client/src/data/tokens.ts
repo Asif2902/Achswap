@@ -32,6 +32,7 @@ const arcTestnetTokens: Token[] = [
 ];
 
 // Wrapped token mappings: native -> wrapped address
+// Note: Keys are stored in lowercase for consistent lookup
 export const wrappedTokenMap: Record<number, Record<string, string>> = {
   5042002: {
     // USDC (native/zero address) -> wUSDC
@@ -40,22 +41,25 @@ export const wrappedTokenMap: Record<number, Record<string, string>> = {
 };
 
 // Reverse mapping: wrapped -> native
+// Note: Keys are stored in lowercase for consistent lookup
 export const unwrappedTokenMap: Record<number, Record<string, string>> = {
   5042002: {
-    "0xDe5DB9049a8dd344dC1B7Bbb098f9da60930A6dA": "0x0000000000000000000000000000000000000000",
+    "0xde5db9049a8dd344dc1b7bbb098f9da60930a6da": "0x0000000000000000000000000000000000000000",
   },
 };
 
 export function getWrappedAddress(chainId: number, tokenAddress: string): string | null {
   const map = wrappedTokenMap[chainId];
   if (!map) return null;
-  return map[tokenAddress.toLowerCase()] || map[tokenAddress] || null;
+  // Always use lowercase for lookup to ensure consistency
+  return map[tokenAddress.toLowerCase()] || null;
 }
 
 export function getUnwrappedAddress(chainId: number, tokenAddress: string): string | null {
   const map = unwrappedTokenMap[chainId];
   if (!map) return null;
-  return map[tokenAddress.toLowerCase()] || map[tokenAddress] || null;
+  // Always use lowercase for lookup to ensure consistency
+  return map[tokenAddress.toLowerCase()] || null;
 }
 
 export function isNativeToken(tokenAddress: string): boolean {
