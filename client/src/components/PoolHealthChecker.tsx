@@ -1,324 +1,269 @@
-import { useState, useEffect, useCallback } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Contract, BrowserProvider } from "ethers";
 import { getContractsForChain } from "@/lib/contracts";
-import { V3_FACTORY_ABI, V3_POOL_ABI, NONFUNGIBLE_POSITION_MANAGER_ABI } from "@/lib/abis/v3";
-import { sqrtPriceX96ToPrice, priceToSqrtPriceX96, sortTokens } from "@/lib/v3-utils";
-import { parseAmount } from "@/lib/decimal-utils";
+import { NONFUNGIBLE_POSITION_MANAGER_ABI } from "@/lib/abis/v3";
+import { priceToSqrtPriceX96, sortTokens } from "@/lib/v3-utils";
+import { isNativeToken, getWrappedAddress } from "@/data/tokens";
 import { useToast } from "@/hooks/use-toast";
 import type { Token } from "@shared/schema";
 import {
-  AlertTriangle,
   CheckCircle2,
   XCircle,
   Wrench,
   RefreshCw,
-  Info,
   ExternalLink,
   Zap,
   TriangleAlert,
 } from "lucide-react";
 
-// ─── Uniswap V3 tick bounds ───────────────────────────────────────────────────
-const MIN_TICK = -887272;
+// ─── Constants ────────────────────────────────────────────────────────────────
+
 const MAX_TICK = 887272;
-
-// Warn when the pool tick is within 5% of the absolute bound
-const TICK_EXTREME_THRESHOLD = Math.floor(MAX_TICK * 0.95); // ±843,108
-
-// If price deviates > this factor from 1 and amounts are both > 0, flag a mismatch
-const PRICE_MISMATCH_FACTOR = 1000;
+// Flag ticks beyond 50% of max as extreme – catches broken 10% fee pools too
+const TICK_EXTREME_THRESHOLD = Math.floor(MAX_TICK * 0.5); // 443,636
+// Flag price mismatch when pool vs expected differs by more than 50×
+const PRICE_MISMATCH_FACTOR = 50;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
 export type PoolIssueKind =
   | "HEALTHY"
-  | "UNINITIALIZED"           // pool exists but sqrtPriceX96 === 0
-  | "PRICE_EXTREME"           // tick at or near ±MAX_TICK
-  | "PRICE_MISMATCH"          // pool price wildly differs from user-supplied ratio
-  | "NO_ACTIVE_LIQUIDITY"     // pool initialized but liquidity = 0 at current tick
-  | "UNKNOWN";
+  | "POOL_NOT_EXIST"
+  | "UNINITIALIZED"
+  | "PRICE_EXTREME"
+  | "PRICE_MISMATCH"
+  | "NO_ACTIVE_LIQUIDITY";
 
 export interface PoolHealthResult {
-  poolAddress: string | null;
-  poolExists: boolean;
   issue: PoolIssueKind;
   severity: "ok" | "warn" | "error";
-  sqrtPriceX96: bigint | null;
-  currentTick: number | null;
-  currentPrice: number | null;
-  activeLiquidity: bigint | null;
   description: string;
   suggestedFix: string | null;
   canAutoFix: boolean;
 }
 
+// ─── Props ────────────────────────────────────────────────────────────────────
+// The parent already fetches all pool state – we accept it here to avoid
+// duplicate lookups and the address-resolution bugs that came with them.
+
 interface PoolHealthCheckerProps {
+  poolAddress: string | null;
+  poolExists: boolean;
+  sqrtPriceX96: bigint | null;
+  currentTick: number | null;
+  currentPrice: number | null;
+  activeLiquidity: bigint | null;
+  token0Symbol: string;
+  token1Symbol: string;
+  // User-entered price ratio (token1/token0, sorted order) for mismatch detection
+  expectedPriceRatio?: number | null;
+  // Needed only for the Initialize Pool fix button
   tokenA: Token | null;
   tokenB: Token | null;
   fee: number;
   chainId: number;
-  /** If provided, the checker will compare the pool price to this expected ratio */
-  expectedPriceRatio?: number | null;
   onHealthChange?: (result: PoolHealthResult) => void;
+  /** Called after a successful on-chain fix so the parent can re-fetch */
+  onFixed?: () => void;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Pure diagnosis function ──────────────────────────────────────────────────
 
-function getERC20Addr(token: Token, chainId: number): string {
-  // Inline – avoids import coupling; mirrors AddLiquidityV3Basic's helper
-  const NATIVE_ADDRS = ["0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", "0x0000000000000000000000000000000000001010"];
-  if (NATIVE_ADDRS.some((n) => n.toLowerCase() === token.address.toLowerCase())) {
-    // Return WETH/WMATIC address stored in token.wrappedAddress if present
-    return (token as any).wrappedAddress ?? token.address;
-  }
-  return token.address;
-}
-
-function severityColor(s: PoolHealthResult["severity"]) {
-  if (s === "ok") return "text-green-400";
-  if (s === "warn") return "text-yellow-400";
-  return "text-red-400";
-}
-
-function severityBg(s: PoolHealthResult["severity"]) {
-  if (s === "ok") return "bg-green-500/10 border-green-500/20";
-  if (s === "warn") return "bg-yellow-500/10 border-yellow-500/20";
-  return "bg-red-500/10 border-red-500/20";
-}
-
-function SeverityIcon({ s }: { s: PoolHealthResult["severity"] }) {
-  if (s === "ok") return <CheckCircle2 className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />;
-  if (s === "warn") return <TriangleAlert className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />;
-  return <XCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />;
-}
-
-// ─── Diagnosis logic ──────────────────────────────────────────────────────────
-
-async function diagnosePool(
-  tokenA: Token,
-  tokenB: Token,
-  fee: number,
-  chainId: number,
+function diagnose(
+  poolExists: boolean,
+  sqrtPriceX96: bigint | null,
+  currentTick: number | null,
+  currentPrice: number | null,
+  activeLiquidity: bigint | null,
+  token0Symbol: string,
+  token1Symbol: string,
   expectedPriceRatio?: number | null
-): Promise<PoolHealthResult> {
-  const blank: PoolHealthResult = {
-    poolAddress: null,
-    poolExists: false,
-    issue: "UNKNOWN",
-    severity: "warn",
-    sqrtPriceX96: null,
-    currentTick: null,
-    currentPrice: null,
-    activeLiquidity: null,
-    description: "Unable to fetch pool data.",
-    suggestedFix: null,
-    canAutoFix: false,
-  };
+): PoolHealthResult {
 
-  const contracts = getContractsForChain(chainId);
-  if (!contracts || !window.ethereum) return blank;
-
-  const provider = new BrowserProvider(window.ethereum);
-  const factory = new Contract(contracts.v3.factory, V3_FACTORY_ABI, provider);
-
-  const addr0 = getERC20Addr(tokenA, chainId);
-  const addr1 = getERC20Addr(tokenB, chainId);
-  const [tok0, tok1] = sortTokens(
-    { ...tokenA, address: addr0 },
-    { ...tokenB, address: addr1 }
-  );
-
-  let poolAddress: string;
-  try {
-    poolAddress = await factory.getPool(tok0.address, tok1.address, fee);
-  } catch {
-    return { ...blank, description: "Failed to query factory." };
-  }
-
-  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
-  if (!poolAddress || poolAddress === ZERO_ADDR) {
+  if (!poolExists) {
     return {
-      ...blank,
-      issue: "HEALTHY",
+      issue: "POOL_NOT_EXIST",
       severity: "ok",
-      poolExists: false,
-      description: "Pool does not exist yet – it will be created when you add liquidity.",
+      description: "No pool exists yet for this pair and fee tier. It will be created when you add liquidity.",
       suggestedFix: null,
       canAutoFix: false,
     };
   }
 
-  // Pool exists – inspect state
-  const pool = new Contract(poolAddress, V3_POOL_ABI, provider);
-  let slot0: any;
-  let liquidity: bigint;
-
-  try {
-    [slot0, liquidity] = await Promise.all([pool.slot0(), pool.liquidity()]);
-  } catch {
+  // Can't read state (RPC error or truly broken contract)
+  if (sqrtPriceX96 === null || currentTick === null) {
     return {
-      ...blank,
-      poolAddress,
-      poolExists: true,
-      description: "Pool exists but slot0/liquidity read failed – the contract may be broken.",
+      issue: "UNINITIALIZED",
+      severity: "error",
+      description: "Pool contract exists but its state could not be read. It may be uninitialized or the RPC failed.",
+      suggestedFix: "Try refreshing. If the issue persists the pool may need to be re-initialized.",
+      canAutoFix: false,
     };
   }
 
-  const sqrtPriceX96: bigint = slot0[0];
-  const currentTick: number = Number(slot0[1]);
-
-  // ── Issue: uninitialized ──────────────────────────────────────────────────
+  // sqrtPriceX96 === 0 → contract deployed but initialize() never called
   if (sqrtPriceX96 === 0n) {
     return {
-      poolAddress,
-      poolExists: true,
       issue: "UNINITIALIZED",
       severity: "error",
-      sqrtPriceX96,
-      currentTick,
-      currentPrice: null,
-      activeLiquidity: liquidity,
       description:
         "The pool contract exists but was never initialized (sqrtPriceX96 = 0). " +
-        "No swaps or liquidity additions are possible until it is initialized.",
+        "Neither liquidity additions nor swaps are possible until it is initialized.",
       suggestedFix:
-        "Call createAndInitializePoolIfNecessary on the NonfungiblePositionManager " +
-        "with a valid sqrtPriceX96. Use the fix button below to initialize at your desired price.",
+        "Enter your desired token amounts above, then click Initialize Pool. " +
+        "The initial price will be derived from your entered amounts.",
       canAutoFix: true,
     };
   }
 
-  const currentPrice = sqrtPriceX96ToPrice(sqrtPriceX96, tok0.decimals, tok1.decimals);
-
-  // ── Issue: price extreme ──────────────────────────────────────────────────
+  // Tick near absolute limits → price is effectively at 0 or ∞
   if (Math.abs(currentTick) >= TICK_EXTREME_THRESHOLD) {
+    const direction =
+      currentTick > 0
+        ? `${token0Symbol} is massively undervalued vs ${token1Symbol}`
+        : `${token1Symbol} is massively undervalued vs ${token0Symbol}`;
     return {
-      poolAddress,
-      poolExists: true,
       issue: "PRICE_EXTREME",
       severity: "error",
-      sqrtPriceX96,
-      currentTick,
-      currentPrice,
-      activeLiquidity: liquidity,
       description:
-        `Pool tick (${currentTick}) is near the absolute limit (±${MAX_TICK}). ` +
-        "This usually means the pool was initialized with a wildly wrong price (e.g. 1 : 1 000 000 000). " +
-        "Adding liquidity or swapping is effectively impossible without first correcting the price.",
+        `Pool tick is ${currentTick.toLocaleString()} (absolute limit: ±${MAX_TICK.toLocaleString()}). ` +
+        `${direction}. This usually means the pool was initialized with a wildly wrong price. ` +
+        "You cannot add liquidity or swap until the price is corrected.",
       suggestedFix:
-        liquidity === 0n
-          ? "Because there is no active liquidity you can deploy a tiny 'bootstrap' position that " +
-            "spans the broken price AND your target price, then perform a corrective swap. " +
-            "Use the guided fix below."
-          : "An arbitrage swap is needed to move the price back in range. " +
-            "The fix button will attempt a zero-cost corrective swap if the pool has liquidity.",
-      canAutoFix: liquidity === 0n, // can only auto-fix (bootstrap) when no liquidity
+        activeLiquidity === 0n
+          ? "1) Add a tiny full-range position (0.001 of each token, Basic Mode). " +
+            "2) Swap from the overvalued token to the undervalued one until price nears market rate. " +
+            "3) Remove the bootstrap position. 4) Add your real amounts."
+          : "Use the Swap tab: swap from the overvalued token into the undervalued one repeatedly " +
+            "until the pool price reaches the correct market rate.",
+      canAutoFix: false,
     };
   }
 
-  // ── Issue: price mismatch ─────────────────────────────────────────────────
-  if (expectedPriceRatio != null && expectedPriceRatio > 0) {
+  // Price mismatch – pool price vs user ratio differ significantly
+  if (expectedPriceRatio != null && expectedPriceRatio > 0 && currentPrice != null && currentPrice > 0) {
     const ratio = currentPrice / expectedPriceRatio;
-    if (ratio > PRICE_MISMATCH_FACTOR || ratio < 1 / PRICE_MISMATCH_FACTOR) {
+    const deviation = Math.max(ratio, 1 / ratio);
+    if (deviation > PRICE_MISMATCH_FACTOR) {
       return {
-        poolAddress,
-        poolExists: true,
         issue: "PRICE_MISMATCH",
         severity: "warn",
-        sqrtPriceX96,
-        currentTick,
-        currentPrice,
-        activeLiquidity: liquidity,
         description:
-          `Pool price (${currentPrice.toExponential(3)} ${tok1.symbol}/${tok0.symbol}) ` +
-          `differs from your input ratio (${expectedPriceRatio.toExponential(3)}) by ` +
-          `${Math.round(Math.max(ratio, 1 / ratio))}×. ` +
-          "You may be adding liquidity at a heavily unfavourable price.",
+          `Pool price (${currentPrice.toExponential(3)} ${token1Symbol}/${token0Symbol}) ` +
+          `is ${Math.round(deviation)}× different from your entered ratio ` +
+          `(${expectedPriceRatio.toExponential(3)}). ` +
+          "You will likely provide all liquidity as one token at a very unfavourable rate.",
         suggestedFix:
-          "Double-check your token amounts, or swap first to move the pool price closer to market.",
+          "Double-check your token amounts. If the pool price itself is wrong, " +
+          "a corrective swap is needed before adding liquidity.",
         canAutoFix: false,
       };
     }
   }
 
-  // ── Issue: no active liquidity at current tick ────────────────────────────
-  if (liquidity === 0n) {
+  // Initialized but no active liquidity at current tick
+  if (activeLiquidity === 0n) {
     return {
-      poolAddress,
-      poolExists: true,
       issue: "NO_ACTIVE_LIQUIDITY",
       severity: "warn",
-      sqrtPriceX96,
-      currentTick,
-      currentPrice,
-      activeLiquidity: liquidity,
       description:
-        "The pool is initialized and the price looks reasonable, but there is no active " +
-        "liquidity at the current tick. Swaps will revert until someone adds liquidity that " +
-        "includes the current tick in its range.",
-      suggestedFix:
-        "Add liquidity with a tick range that covers the current tick " +
-        `(currently tick ${currentTick}). Basic Mode does this automatically.`,
+        `Pool is initialized at tick ${currentTick.toLocaleString()} but has zero active liquidity here. ` +
+        "Swaps will fail until someone adds a position covering this tick.",
+      suggestedFix: "You can still add liquidity – Basic Mode automatically covers the current tick.",
       canAutoFix: false,
     };
   }
 
-  // ── Healthy ───────────────────────────────────────────────────────────────
   return {
-    poolAddress,
-    poolExists: true,
     issue: "HEALTHY",
     severity: "ok",
-    sqrtPriceX96,
-    currentTick,
-    currentPrice,
-    activeLiquidity: liquidity,
-    description: `Pool is healthy. Current price: ${currentPrice.toFixed(6)} ${tok1.symbol} per ${tok0.symbol}.`,
+    description:
+      currentPrice != null
+        ? `Pool healthy. Price: ${currentPrice.toFixed(6)} ${token1Symbol} per ${token0Symbol}.`
+        : "Pool is healthy.",
     suggestedFix: null,
     canAutoFix: false,
   };
 }
 
+// ─── Style helpers ────────────────────────────────────────────────────────────
+
+function severityColor(s: PoolHealthResult["severity"]) {
+  if (s === "ok")   return "text-green-400";
+  if (s === "warn") return "text-yellow-400";
+  return "text-red-400";
+}
+
+function severityBg(s: PoolHealthResult["severity"]) {
+  if (s === "ok")   return "bg-green-500/10 border-green-500/20";
+  if (s === "warn") return "bg-yellow-500/10 border-yellow-500/20";
+  return "bg-red-500/10 border-red-500/20";
+}
+
+function SeverityIcon({ s }: { s: PoolHealthResult["severity"] }) {
+  if (s === "ok")   return <CheckCircle2 className="h-5 w-5 text-green-400 shrink-0 mt-0.5" />;
+  if (s === "warn") return <TriangleAlert className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />;
+  return <XCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />;
+}
+
+function issueLabel(issue: PoolIssueKind) {
+  switch (issue) {
+    case "POOL_NOT_EXIST":      return "Pool will be created";
+    case "UNINITIALIZED":       return "⚠ Pool Not Initialized";
+    case "PRICE_EXTREME":       return "🚨 Pool Price is Broken";
+    case "PRICE_MISMATCH":      return "⚠ Pool Price Mismatch";
+    case "NO_ACTIVE_LIQUIDITY": return "ℹ No Active Liquidity";
+    default:                    return "✓ Pool Healthy";
+  }
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function PoolHealthChecker({
+  poolAddress,
+  poolExists,
+  sqrtPriceX96,
+  currentTick,
+  currentPrice,
+  activeLiquidity,
+  token0Symbol,
+  token1Symbol,
+  expectedPriceRatio,
   tokenA,
   tokenB,
   fee,
   chainId,
-  expectedPriceRatio,
   onHealthChange,
+  onFixed,
 }: PoolHealthCheckerProps) {
-  const [health, setHealth] = useState<PoolHealthResult | null>(null);
-  const [isChecking, setIsChecking] = useState(false);
   const [isFixing, setIsFixing] = useState(false);
   const { toast } = useToast();
 
-  const runCheck = useCallback(async () => {
-    if (!tokenA || !tokenB) return;
-    setIsChecking(true);
-    try {
-      const result = await diagnosePool(tokenA, tokenB, fee, chainId, expectedPriceRatio);
-      setHealth(result);
-      onHealthChange?.(result);
-    } catch (err) {
-      console.error("Pool health check failed:", err);
-    } finally {
-      setIsChecking(false);
-    }
-  }, [tokenA, tokenB, fee, chainId, expectedPriceRatio]);
+  const health = diagnose(
+    poolExists,
+    sqrtPriceX96,
+    currentTick,
+    currentPrice,
+    activeLiquidity,
+    token0Symbol,
+    token1Symbol,
+    expectedPriceRatio
+  );
 
   useEffect(() => {
-    runCheck();
-  }, [runCheck]);
+    onHealthChange?.(health);
+  // Intentionally depend on primitive fields to avoid infinite loops
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [health.issue, health.severity]);
 
-  // ── Auto-fix: initialize an uninitialized pool ────────────────────────────
-  const handleFixUninitialized = async () => {
-    if (!health || !tokenA || !tokenB || !window.ethereum) return;
+  // ── Initialize broken / uninitialized pool ────────────────────────────────
+  const handleInitialize = async () => {
+    if (!tokenA || !tokenB || !window.ethereum) return;
     if (!expectedPriceRatio || expectedPriceRatio <= 0) {
       toast({
-        title: "Cannot fix",
-        description: "Enter token amounts first so we know the desired initial price.",
+        title: "Enter token amounts first",
+        description: "Fill in both amounts above so we can derive the initial price.",
         variant: "destructive",
       });
       return;
@@ -332,14 +277,17 @@ export function PoolHealthChecker({
       const provider = new BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
 
-      const addr0 = getERC20Addr(tokenA, chainId);
-      const addr1 = getERC20Addr(tokenB, chainId);
+      const getERC20 = (t: Token) => {
+        if (isNativeToken(t.address)) return getWrappedAddress(chainId, t.address) ?? t.address;
+        return t.address;
+      };
+
       const [tok0, tok1] = sortTokens(
-        { ...tokenA, address: addr0 },
-        { ...tokenB, address: addr1 }
+        { ...tokenA, address: getERC20(tokenA) },
+        { ...tokenB, address: getERC20(tokenB) }
       );
 
-      const sqrtPriceX96 = priceToSqrtPriceX96(expectedPriceRatio, tok0.decimals, tok1.decimals);
+      const sqrtP = priceToSqrtPriceX96(expectedPriceRatio, tok0.decimals, tok1.decimals);
 
       const posManager = new Contract(
         contracts.v3.nonfungiblePositionManager,
@@ -347,13 +295,9 @@ export function PoolHealthChecker({
         signer
       );
 
-      toast({ title: "Initializing pool...", description: "Sending initialization transaction" });
-
+      toast({ title: "Initializing pool…", description: "Sending initialization transaction" });
       const tx = await posManager.createAndInitializePoolIfNecessary(
-        tok0.address,
-        tok1.address,
-        fee,
-        sqrtPriceX96
+        tok0.address, tok1.address, fee, sqrtP
       );
       const receipt = await tx.wait();
 
@@ -361,7 +305,7 @@ export function PoolHealthChecker({
         title: "Pool initialized!",
         description: (
           <div className="flex items-center gap-2">
-            <span>Pool is now ready for liquidity</span>
+            <span>Pool is ready – you can now add liquidity.</span>
             <a
               href={`${contracts.explorer}${receipt.hash}`}
               target="_blank"
@@ -374,11 +318,11 @@ export function PoolHealthChecker({
         ),
       });
 
-      await runCheck();
+      onFixed?.();
     } catch (err: any) {
-      console.error("Fix failed:", err);
+      console.error("Initialize failed:", err);
       toast({
-        title: "Fix failed",
+        title: "Initialization failed",
         description: err.reason ?? err.message ?? "Transaction failed",
         variant: "destructive",
       });
@@ -387,101 +331,85 @@ export function PoolHealthChecker({
     }
   };
 
-  // ── Auto-fix: extreme price – bootstrap + correct ─────────────────────────
-  /**
-   * For a pool with extreme price and zero liquidity:
-   * 1. Add a tiny full-range position (so the pool has *some* liquidity)
-   * 2. Perform a swap from the expensive token → cheap token to walk the tick
-   *    back toward the target price.
-   *
-   * NOTE: This is a best-effort fix. Because the broken tick may be near
-   * ±887272, full-range positions still cover it. The swap amount needed to
-   * move an extreme price all the way back can be very large; in practice
-   * the user should set a realistic target and the contract will consume
-   * only what's needed (amountSpecified is negative → exactOutput).
-   *
-   * We surface this as guidance rather than a fully-automated tx because the
-   * swap cost varies wildly by how broken the price is.
-   */
-  const handleFixExtremePriceGuide = () => {
+  const handleShowExtremeGuide = () => {
     toast({
-      title: "Guided fix for extreme price",
-      description:
-        "Step 1: Add a tiny full-range liquidity position (Basic Mode, small amounts). " +
-        "Step 2: Use the Swap tab to swap in the direction that moves price toward market. " +
-        "Step 3: Re-add your main liquidity. This resets the pool price.",
-      duration: 10000,
+      title: "How to fix a broken pool price",
+      description: (
+        <div className="space-y-1.5 text-xs leading-relaxed">
+          <p><strong>Step 1:</strong> Add a tiny full-range position (0.001 of each token) in Basic Mode – this gives the pool some liquidity to work with.</p>
+          <p><strong>Step 2:</strong> Go to the Swap tab and swap the overvalued token for the undervalued one. Repeat until price is near market rate.</p>
+          <p><strong>Step 3:</strong> Remove the bootstrap position from Remove Liquidity tab.</p>
+          <p><strong>Step 4:</strong> Add your real liquidity normally.</p>
+        </div>
+      ),
+      duration: 20000,
     });
   };
 
-  if (!tokenA || !tokenB) return null;
-  if (isChecking) {
-    return (
-      <div className="flex items-center gap-2 p-3 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 text-sm">
-        <RefreshCw className="h-4 w-4 animate-spin" />
-        Checking pool health…
-      </div>
-    );
-  }
-  if (!health) return null;
-  if (health.issue === "HEALTHY" && health.poolExists) {
-    // Compact green banner only
+  // ── Compact OK banner ─────────────────────────────────────────────────────
+  if (health.severity === "ok") {
     return (
       <div className={`flex items-center gap-2 p-3 rounded-lg border text-sm ${severityBg("ok")}`}>
-        <CheckCircle2 className="h-4 w-4 text-green-400" />
-        <span className={severityColor("ok")}>{health.description}</span>
-        <button onClick={runCheck} className="ml-auto text-slate-500 hover:text-slate-300">
-          <RefreshCw className="h-3.5 w-3.5" />
-        </button>
-      </div>
-    );
-  }
-  if (health.issue === "HEALTHY" && !health.poolExists) {
-    // Pool doesn't exist – benign, but show a muted note
-    return (
-      <div className={`flex items-center gap-2 p-3 rounded-lg border text-sm ${severityBg("ok")}`}>
-        <Info className="h-4 w-4 text-green-400" />
+        <SeverityIcon s="ok" />
         <span className="text-slate-300">{health.description}</span>
       </div>
     );
   }
 
-  // Non-healthy states → full diagnostic card
+  // ── Full diagnostic card ──────────────────────────────────────────────────
   return (
     <div className={`rounded-lg border p-4 space-y-3 ${severityBg(health.severity)}`}>
-      {/* Header */}
       <div className="flex items-start gap-3">
         <SeverityIcon s={health.severity} />
         <div className="flex-1 min-w-0">
           <div className={`font-semibold text-sm ${severityColor(health.severity)}`}>
             {issueLabel(health.issue)}
           </div>
-          <p className="text-xs text-slate-300 mt-1 leading-relaxed">{health.description}</p>
+          <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+            {health.description}
+          </p>
         </div>
-        <button onClick={runCheck} className="text-slate-500 hover:text-slate-300 shrink-0" title="Re-check">
-          <RefreshCw className="h-4 w-4" />
-        </button>
       </div>
 
-      {/* Diagnostic details */}
-      {health.poolExists && (
+      {/* Debug grid for error states */}
+      {health.severity === "error" && (
         <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-          {health.currentTick !== null && (
-            <Detail label="Current tick" value={health.currentTick.toLocaleString()} warn={Math.abs(health.currentTick) >= TICK_EXTREME_THRESHOLD} />
+          {currentTick !== null && (
+            <div className="bg-slate-900/50 rounded p-1.5">
+              <div className="text-slate-500">Current tick</div>
+              <div className={Math.abs(currentTick) >= TICK_EXTREME_THRESHOLD ? "text-red-400" : "text-slate-200"}>
+                {currentTick.toLocaleString()}
+              </div>
+            </div>
           )}
-          {health.currentPrice !== null && (
-            <Detail label="Pool price" value={`${health.currentPrice.toExponential(4)}`} />
+          {sqrtPriceX96 !== null && (
+            <div className="bg-slate-900/50 rounded p-1.5">
+              <div className="text-slate-500">sqrtPriceX96</div>
+              <div className={sqrtPriceX96 === 0n ? "text-red-400" : "text-slate-200"}>
+                {sqrtPriceX96 === 0n
+                  ? "0 ← uninitialized"
+                  : `${sqrtPriceX96.toString().slice(0, 8)}… (${sqrtPriceX96.toString().length}d)`}
+              </div>
+            </div>
           )}
-          {health.sqrtPriceX96 !== null && (
-            <Detail label="sqrtPriceX96" value={health.sqrtPriceX96 === 0n ? "0 ⚠" : abbreviate(health.sqrtPriceX96)} warn={health.sqrtPriceX96 === 0n} />
+          {activeLiquidity !== null && (
+            <div className="bg-slate-900/50 rounded p-1.5">
+              <div className="text-slate-500">Active liquidity</div>
+              <div className={activeLiquidity === 0n ? "text-yellow-400" : "text-slate-200"}>
+                {activeLiquidity === 0n ? "0 (none)" : activeLiquidity.toString().slice(0, 10) + "…"}
+              </div>
+            </div>
           )}
-          {health.activeLiquidity !== null && (
-            <Detail label="Active liquidity" value={health.activeLiquidity === 0n ? "0 ⚠" : abbreviate(health.activeLiquidity)} warn={health.activeLiquidity === 0n} />
+          {poolAddress && (
+            <div className="bg-slate-900/50 rounded p-1.5">
+              <div className="text-slate-500">Pool</div>
+              <div className="text-slate-200">{poolAddress.slice(0, 6)}…{poolAddress.slice(-4)}</div>
+            </div>
           )}
         </div>
       )}
 
-      {/* Suggested fix text */}
+      {/* Suggested fix */}
       {health.suggestedFix && (
         <div className="flex items-start gap-2 text-xs text-slate-400 bg-slate-900/60 rounded p-2">
           <Wrench className="h-3.5 w-3.5 shrink-0 mt-0.5 text-slate-500" />
@@ -489,20 +417,19 @@ export function PoolHealthChecker({
         </div>
       )}
 
-      {/* Fix actions */}
+      {/* Action buttons */}
       <div className="flex flex-wrap gap-2">
-        {health.issue === "UNINITIALIZED" && health.canAutoFix && (
+        {health.issue === "UNINITIALIZED" && (
           <Button
             size="sm"
             className="bg-blue-600 hover:bg-blue-700 text-white"
             disabled={isFixing || !expectedPriceRatio}
-            onClick={handleFixUninitialized}
+            onClick={handleInitialize}
           >
-            {isFixing ? (
-              <><RefreshCw className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Initializing…</>
-            ) : (
-              <><Zap className="h-3.5 w-3.5 mr-1.5" /> Initialize Pool</>
-            )}
+            {isFixing
+              ? <><RefreshCw className="h-3.5 w-3.5 mr-1.5 animate-spin" />Initializing…</>
+              : <><Zap className="h-3.5 w-3.5 mr-1.5" />Initialize Pool</>
+            }
           </Button>
         )}
 
@@ -510,59 +437,31 @@ export function PoolHealthChecker({
           <Button
             size="sm"
             variant="outline"
-            className="border-yellow-500/50 text-yellow-400 hover:bg-yellow-500/10"
-            onClick={handleFixExtremePriceGuide}
+            className="border-red-500/50 text-red-400 hover:bg-red-500/10"
+            onClick={handleShowExtremeGuide}
           >
-            <Wrench className="h-3.5 w-3.5 mr-1.5" /> Show Fix Guide
+            <Wrench className="h-3.5 w-3.5 mr-1.5" />Show Fix Steps
           </Button>
         )}
 
-        {health.poolAddress && (
+        {poolAddress && (
           <a
-            href={`https://scan.testnet.arc.network/address/${health.poolAddress}`}
+            href={`https://scan.testnet.arc.network/address/${poolAddress}`}
             target="_blank"
             rel="noopener noreferrer"
           >
             <Button size="sm" variant="ghost" className="text-slate-400">
-              <ExternalLink className="h-3.5 w-3.5 mr-1.5" /> View Pool
+              <ExternalLink className="h-3.5 w-3.5 mr-1.5" />View Pool
             </Button>
           </a>
         )}
       </div>
 
-      {/* Extra warning: uninitialized but no ratio provided */}
       {health.issue === "UNINITIALIZED" && !expectedPriceRatio && (
         <p className="text-xs text-yellow-400/80">
-          ⚠ Enter amounts in both token fields first so the initializer knows your desired price.
+          ↑ Enter amounts in both token fields above to enable the Initialize button.
         </p>
       )}
     </div>
   );
-}
-
-// ─── Small sub-components ─────────────────────────────────────────────────────
-
-function Detail({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
-  return (
-    <div className="bg-slate-900/50 rounded p-1.5">
-      <div className="text-slate-500">{label}</div>
-      <div className={warn ? "text-red-400" : "text-slate-200"}>{value}</div>
-    </div>
-  );
-}
-
-function abbreviate(n: bigint): string {
-  const s = n.toString();
-  if (s.length <= 8) return s;
-  return `${s.slice(0, 4)}…${s.slice(-4)} (${s.length} digits)`;
-}
-
-function issueLabel(issue: PoolIssueKind): string {
-  switch (issue) {
-    case "UNINITIALIZED":      return "⚠ Pool Not Initialized";
-    case "PRICE_EXTREME":      return "🚨 Pool Price is Broken / Extreme";
-    case "PRICE_MISMATCH":     return "⚠ Pool Price Mismatch";
-    case "NO_ACTIVE_LIQUIDITY":return "ℹ No Active Liquidity";
-    default:                   return "⚠ Pool Issue Detected";
-  }
 }
