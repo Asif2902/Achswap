@@ -50,7 +50,7 @@ export default function Swap() {
   const [tokens, setTokens] = useState<Token[]>([]);
   const [isSwapping, setIsSwapping] = useState(false);
   const [isLoadingQuote, setIsLoadingQuote] = useState(false);
-  const [slippage, setSlippage] = useState(100); // Default to Auto (100% = no slippage protection)
+  const [slippage, setSlippage] = useState(0.5); // Default to 0.5% slippage (safe default)
   const [deadline, setDeadline] = useState(20);
   const [recipientAddress, setRecipientAddress] = useState("");
   const [priceImpact, setPriceImpact] = useState<number | null>(null);
@@ -615,8 +615,10 @@ export default function Swap() {
       
       const bestQuote = smartRoutingResult.bestQuote;
       const amountIn = parseAmount(fromAmount, fromToken.decimals);
-      // Auto slippage (100%) = no minimum (0), otherwise calculate based on slippage
-      const minAmountOut = slippage >= 100 ? 0n : (bestQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n;
+      // Calculate minimum output with slippage protection
+      // slippage is a percentage (e.g., 0.5 means 0.5%)
+      const slippageBps = BigInt(Math.floor(slippage * 100)); // Convert to basis points
+      const minAmountOut = (bestQuote.outputAmount * (10000n - slippageBps)) / 10000n;
       const deadlineTimestamp = Math.floor(Date.now() / 1000) + (deadline * 60);
       
       // Validate and checksum recipient address
@@ -765,7 +767,7 @@ export default function Swap() {
                   toToken,
                   alternativeQuote,
                   amountIn,
-                  slippage >= 100 ? 0n : (alternativeQuote.outputAmount * BigInt(Math.floor((100 - slippage) * 100))) / 10000n,
+                  (alternativeQuote.outputAmount * (10000n - BigInt(Math.floor(slippage * 100)))) / 10000n,
                   deadlineTimestamp,
                   recipient,
                   address,
@@ -1259,9 +1261,7 @@ export default function Swap() {
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-muted-foreground">Minimum Received</span>
                       <span className="font-medium">
-                        {slippage >= 100 
-                          ? "0 (Auto mode)" 
-                          : `${(parseFloat(toAmount) * (100 - slippage) / 100).toFixed(6)} ${toToken.symbol}`}
+                        {`${(parseFloat(toAmount) * (100 - slippage) / 100).toFixed(6)} ${toToken.symbol}`}
                       </span>
                     </div>
                     
