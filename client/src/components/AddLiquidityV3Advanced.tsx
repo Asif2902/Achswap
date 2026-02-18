@@ -41,6 +41,27 @@ function getERC20Address(token: Token, chainId: number): string {
 
 type DepositMode = "dual" | "token0-only" | "token1-only" | "unknown";
 
+/**
+ * Format a counterpart amount for display.
+ * Uses full formatUnits precision to avoid rounding very small values to "0.000000".
+ * Shows up to 8 significant decimal places for reasonable UX, but never loses precision
+ * that would cause amount to display as zero.
+ */
+function formatCounterpartAmount(raw: bigint, decimals: number): string {
+  const full = formatUnits(raw, decimals); // e.g. "0.000000000123456789"
+  const num = parseFloat(full);
+  if (num === 0 && raw > 0n) {
+    // Too small for float representation — return raw string so parseAmount can recover it
+    return full;
+  }
+  if (num !== 0 && Math.abs(num) < 0.00000001) {
+    // Very small but representable — show enough sig figs
+    return num.toPrecision(6);
+  }
+  // Normal range — 8 decimal places, strip trailing zeros
+  return parseFloat(num.toFixed(8)).toString();
+}
+
 export function AddLiquidityV3Advanced() {
   const [tokenA, setTokenA] = useState<Token | null>(null);
   const [tokenB, setTokenB] = useState<Token | null>(null);
@@ -67,6 +88,15 @@ export function AddLiquidityV3Advanced() {
   const [balanceA, setBalanceA] = useState<bigint | null>(null);
   const [balanceB, setBalanceB] = useState<bigint | null>(null);
   const [amountBIsAuto, setAmountBIsAuto] = useState(false);
+
+  // ─── Store raw bigint amounts calculated by V3 math so handleAddLiquidity
+  // can use them directly without re-parsing the (possibly-rounded) display string.
+  // Keyed to the current amountA value so they stay in sync.
+  const [autoCalcAmounts, setAutoCalcAmounts] = useState<{
+    amount0: bigint;
+    amount1: bigint;
+    forAmountA: string; // the amountA these were calculated from
+  } | null>(null);
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -192,11 +222,15 @@ export function AddLiquidityV3Advanced() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tokenA, tokenB, selectedFee, contracts, chainId]);
 
-  // Auto-calculate amountB using corrected V3 liquidity math
+  // Auto-calculate amountB using V3 liquidity math.
+  // IMPORTANT: also stores the raw bigint amounts in `autoCalcAmounts` so
+  // handleAddLiquidity can use them without re-parsing the display string.
   useEffect(() => {
     if (!amountA || !tokenA || !tokenB || !chainId) return;
     const aFloat = parseFloat(amountA);
-    if (isNaN(aFloat) || aFloat <= 0) { setAmountB(""); setAmountBIsAuto(false); return; }
+    if (isNaN(aFloat) || aFloat <= 0) {
+      setAmountB(""); setAmountBIsAuto(false); setAutoCalcAmounts(null); return;
+    }
     const s = getSortedTokens(); if (!s) return;
     const { tok0, tok1, isToken0A } = s;
     const tl = minTick ? parseInt(minTick) : null;
@@ -205,25 +239,57 @@ export function AddLiquidityV3Advanced() {
 
     // Out-of-range: single-sided
     if (validTicks && currentTick !== null) {
-      if (currentTick < tl!) { setAmountB("0"); setAmountBIsAuto(true); return; }
-      if (currentTick >= tu!) { setAmountB("0"); setAmountBIsAuto(true); return; }
+      if (currentTick < tl!) {
+        // price below range → only token0
+        const amount0 = parseAmount(amountA, isToken0A ? tok0.decimals : tok1.decimals);
+        setAmountB("0"); setAmountBIsAuto(true);
+        setAutoCalcAmounts({ amount0: isToken0A ? amount0 : 0n, amount1: isToken0A ? 0n : amount0, forAmountA: amountA });
+        return;
+      }
+      if (currentTick >= tu!) {
+        // price above range → only token1
+        const amount1 = parseAmount(amountA, isToken0A ? tok0.decimals : tok1.decimals);
+        setAmountB("0"); setAmountBIsAuto(true);
+        setAutoCalcAmounts({ amount0: isToken0A ? 0n : amount1, amount1: isToken0A ? amount1 : 0n, forAmountA: amountA });
+        return;
+      }
     }
 
     // In-range: use corrected V3 math
     if (validTicks && currentSqrtPriceX96) {
       try {
         const inputBig = parseAmount(amountA, isToken0A ? tok0.decimals : tok1.decimals);
-        const { amount0, amount1 } = calculateAmountsForLiquidity(inputBig, isToken0A, currentSqrtPriceX96, tl!, tu!, tok0.decimals, tok1.decimals);
+        const { amount0, amount1 } = calculateAmountsForLiquidity(
+          inputBig, isToken0A, currentSqrtPriceX96, tl!, tu!, tok0.decimals, tok1.decimals,
+        );
         const counterpart = isToken0A ? amount1 : amount0;
         const counterpartDec = isToken0A ? tok1.decimals : tok0.decimals;
-        if (counterpart > 0n) { setAmountB(parseFloat(formatUnits(counterpart, counterpartDec)).toFixed(6)); setAmountBIsAuto(true); return; }
-      } catch (err) { console.warn("V3 math fallback:", err); }
+
+        // Store raw bigints so tx can use them directly (avoids display-rounding loss)
+        setAutoCalcAmounts({ amount0, amount1, forAmountA: amountA });
+
+        if (counterpart > 0n) {
+          // Use formatCounterpartAmount to preserve precision in display
+          setAmountB(formatCounterpartAmount(counterpart, counterpartDec));
+          setAmountBIsAuto(true);
+          return;
+        } else {
+          // Math returned 0 for counterpart (e.g. price exactly at boundary)
+          setAmountB("0");
+          setAmountBIsAuto(true);
+          return;
+        }
+      } catch (err) {
+        console.warn("V3 math fallback:", err);
+        setAutoCalcAmounts(null);
+      }
     }
 
     // Fallback: spot price
     if (currentPrice) {
       const calc = isToken0A ? aFloat * currentPrice : aFloat / currentPrice;
-      setAmountB(calc.toFixed(6)); setAmountBIsAuto(true);
+      setAmountB(calc.toFixed(8)); setAmountBIsAuto(true);
+      setAutoCalcAmounts(null); // can't store precise bigints for this path
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amountA, minTick, maxTick, currentSqrtPriceX96, currentPrice, currentTick, tokenA, tokenB, chainId]);
@@ -239,7 +305,9 @@ export function AddLiquidityV3Advanced() {
     if (preset === "full") {
       const { tickLower, tickUpper } = getFullRangeTicks(selectedFee);
       setMinTick(tickLower.toString()); setMaxTick(tickUpper.toString());
-      setMinPrice(tickToPrice(tickLower, tok0.decimals, tok1.decimals).toFixed(10)); setMaxPrice(tickToPrice(tickUpper, tok0.decimals, tok1.decimals).toFixed(10));
+      // Use tick→price (not price→tick) so the displayed prices exactly match the ticks
+      setMinPrice(tickToPrice(tickLower, tok0.decimals, tok1.decimals).toFixed(10));
+      setMaxPrice(tickToPrice(tickUpper, tok0.decimals, tok1.decimals).toFixed(10));
     } else if (preset === "wide") {
       const lp = price * 0.5, up = price * 2;
       const tl = getNearestUsableTick(priceToTick(lp, tok0.decimals, tok1.decimals), ts);
@@ -252,11 +320,13 @@ export function AddLiquidityV3Advanced() {
       // Guard: if spacing too large for ±10%, force 1-spacing separation
       if (tl >= tu) { const c = getNearestUsableTick(tick, ts); tl = c - ts; tu = c + ts; }
       setMinTick(tl.toString()); setMaxTick(tu.toString());
-      setMinPrice(tickToPrice(tl, tok0.decimals, tok1.decimals).toFixed(6)); setMaxPrice(tickToPrice(tu, tok0.decimals, tok1.decimals).toFixed(6));
+      setMinPrice(tickToPrice(tl, tok0.decimals, tok1.decimals).toFixed(6));
+      setMaxPrice(tickToPrice(tu, tok0.decimals, tok1.decimals).toFixed(6));
     } else if (preset === "current") {
       const c = getNearestUsableTick(tick, ts);
       setMinTick(c.toString()); setMaxTick((c + ts).toString());
-      setMinPrice(tickToPrice(c, tok0.decimals, tok1.decimals).toFixed(6)); setMaxPrice(tickToPrice(c + ts, tok0.decimals, tok1.decimals).toFixed(6));
+      setMinPrice(tickToPrice(c, tok0.decimals, tok1.decimals).toFixed(6));
+      setMaxPrice(tickToPrice(c + ts, tok0.decimals, tok1.decimals).toFixed(6));
     }
   }, [selectedFee]);
 
@@ -273,11 +343,13 @@ export function AddLiquidityV3Advanced() {
   const handleAddLiquidity = async () => {
     if (!tokenA || !tokenB || !address || !contracts || !window.ethereum || !chainId) return;
     const tickLowerRaw = parseInt(minTick), tickUpperRaw = parseInt(maxTick);
-    if (isNaN(tickLowerRaw) || isNaN(tickUpperRaw) || tickLowerRaw >= tickUpperRaw) { toast({ title: "Invalid price range", description: "Min price must be less than max price", variant: "destructive" }); return; }
+    if (isNaN(tickLowerRaw) || isNaN(tickUpperRaw) || tickLowerRaw >= tickUpperRaw) {
+      toast({ title: "Invalid price range", description: "Min price must be less than max price", variant: "destructive" }); return;
+    }
 
     const aVal = parseFloat(amountA), bVal = parseFloat(amountB);
     if ((depositMode === "dual" || depositMode === "unknown") && (!amountA || aVal <= 0)) { toast({ title: "Enter amount", description: "Enter Token A amount", variant: "destructive" }); return; }
-    if ((depositMode === "dual" || depositMode === "unknown") && (!amountB || bVal <= 0)) { toast({ title: "Enter amount", description: "Enter Token B amount", variant: "destructive" }); return; }
+    if ((depositMode === "dual" || depositMode === "unknown") && (!amountB || bVal < 0)) { toast({ title: "Enter amount", description: "Enter Token B amount", variant: "destructive" }); return; }
     if (depositMode === "token0-only" && (!amountA || aVal <= 0)) { toast({ title: "Enter amount", description: `Enter ${token0Symbol} amount`, variant: "destructive" }); return; }
     if (depositMode === "token1-only" && (!amountB || bVal <= 0)) { toast({ title: "Enter amount", description: `Enter ${token1Symbol} amount`, variant: "destructive" }); return; }
 
@@ -292,25 +364,78 @@ export function AddLiquidityV3Advanced() {
       const [token0, token1] = sortTokens({ ...tokenA, address: tokenAERC20 }, { ...tokenB, address: tokenBERC20 });
       const isToken0A = tokenAERC20.toLowerCase() === token0.address.toLowerCase();
 
-      // Amounts per deposit mode — unused side is 0n
+      const ts = getTickSpacing(selectedFee);
+      const tickLower = getNearestUsableTick(tickLowerRaw, ts);
+      const tickUpper = getNearestUsableTick(tickUpperRaw, ts);
+      if (tickLower >= tickUpper) {
+        toast({ title: "Invalid tick range", description: `Ticks must differ by at least ${ts}`, variant: "destructive" }); return;
+      }
+
+      // ─── Compute amounts ────────────────────────────────────────────────────
+      //
+      // PREFERRED PATH: if amountB was auto-calculated from V3 math AND the
+      // autoCalcAmounts are still in sync with the current amountA, use the
+      // stored bigints directly.  This avoids re-parsing the display string which
+      // may have been rounded (e.g. "0.000000" for a very small counterpart).
+      //
+      // FALLBACK: re-compute from V3 math fresh at tx time.
+      // LAST RESORT: parse the display strings (manual entry / spot-price fallback).
+      //
       let amount0Desired: bigint, amount1Desired: bigint;
+
       if (depositMode === "token0-only") {
-        amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals); amount1Desired = 0n;
-      } else if (depositMode === "token1-only") {
-        amount0Desired = 0n; amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
-      } else {
+        // Only token0; token1 side must be 0
         amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
+        amount1Desired = 0n;
+
+      } else if (depositMode === "token1-only") {
+        // Only token1; token0 side must be 0
+        amount0Desired = 0n;
         amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
+
+      } else {
+        // Dual mode — try to get precision-safe amounts
+
+        const useStoredAmounts =
+          amountBIsAuto &&
+          autoCalcAmounts !== null &&
+          autoCalcAmounts.forAmountA === amountA;
+
+        if (useStoredAmounts && autoCalcAmounts) {
+          // Best path: use the exact bigints from the last auto-calc run
+          amount0Desired = autoCalcAmounts.amount0;
+          amount1Desired = autoCalcAmounts.amount1;
+        } else if (currentSqrtPriceX96 && ticksValid) {
+          // Re-compute fresh V3 math (handles cases where state drifted)
+          try {
+            const inputBig = parseAmount(amountA, isToken0A ? token0.decimals : token1.decimals);
+            const { amount0, amount1 } = calculateAmountsForLiquidity(
+              inputBig, isToken0A, currentSqrtPriceX96, tickLower, tickUpper,
+              token0.decimals, token1.decimals,
+            );
+            amount0Desired = amount0;
+            amount1Desired = amount1;
+          } catch (mathErr) {
+            console.warn("V3 math recompute failed, falling back to display strings:", mathErr);
+            amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
+            amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
+          }
+        } else {
+          // Manual entry or spot-price fallback — parse display strings
+          amount0Desired = parseAmount(isToken0A ? amountA : amountB, token0.decimals);
+          amount1Desired = parseAmount(isToken0A ? amountB : amountA, token1.decimals);
+        }
+      }
+
+      // Guard: if both desired amounts are 0 something went wrong
+      if (amount0Desired === 0n && amount1Desired === 0n) {
+        toast({ title: "Amount error", description: "Could not compute valid token amounts. Please enter amounts manually.", variant: "destructive" });
+        return;
       }
 
       let nativeAmount = 0n;
       if (tokenAIsNative) nativeAmount = isToken0A ? amount0Desired : amount1Desired;
       else if (tokenBIsNative) nativeAmount = isToken0A ? amount1Desired : amount0Desired;
-
-      const ts = getTickSpacing(selectedFee);
-      const tickLower = getNearestUsableTick(tickLowerRaw, ts);
-      const tickUpper = getNearestUsableTick(tickUpperRaw, ts);
-      if (tickLower >= tickUpper) { toast({ title: "Invalid tick range", description: `Ticks must differ by at least ${ts}`, variant: "destructive" }); return; }
 
       if (!poolExists) {
         const midPrice = (parseFloat(minPrice) + parseFloat(maxPrice)) / 2;
@@ -336,14 +461,17 @@ export function AddLiquidityV3Advanced() {
         if (await c.allowance(address, pmAddr) < amount1Desired) await (await c.approve(pmAddr, amount1Desired)).wait();
       }
 
-      // CRITICAL: amount0Min and amount1Min must be 0n.
+      // ─── Minimums MUST be 0n ────────────────────────────────────────────────
       //
-      // The NonfungiblePositionManager always takes LESS than desired (never more),
-      // adjusting one side down to match the exact pool ratio. Any non-zero minimum
-      // derived from our math will trigger "Price slippage check" when our ratio
-      // differs even slightly from the contract's. This was causing all failures
-      // for narrow, at-current, and full-range positions.
-      // Desired amounts already bound the maximum — 0 minimums are safe here.
+      // The NonfungiblePositionManager always takes AT MOST the desired amounts,
+      // adjusting one side down to match the exact pool ratio.  Any non-zero
+      // minimum derived from off-chain math will trigger "Price slippage check"
+      // whenever our computed ratio differs even slightly from the on-chain ratio.
+      // This is the root cause of all "Price slippage check" failures for narrow,
+      // at-current, and full-range positions.
+      //
+      // The desired amounts already cap the maximum spend — 0n minimums are safe.
+      //
       const amount0Min = 0n;
       const amount1Min = 0n;
       const deadline   = Math.floor(Date.now() / 1000) + 1200;
@@ -367,7 +495,7 @@ export function AddLiquidityV3Advanced() {
         receipt   = await (await pm.mint(params, { gasLimit: (gas * 150n) / 100n })).wait();
       }
 
-      setAmountA(""); setAmountB(""); setAmountBIsAuto(false);
+      setAmountA(""); setAmountB(""); setAmountBIsAuto(false); setAutoCalcAmounts(null);
       toast({
         title: "Liquidity added!",
         description: (
@@ -431,7 +559,7 @@ export function AddLiquidityV3Advanced() {
               )}
             </div>
             <div className="flex gap-2">
-              <Input type="number" placeholder="0.00" value={amountB} onChange={(e) => { setAmountB(e.target.value); setAmountBIsAuto(false); }} className="flex-1 bg-slate-800 border-slate-600" disabled={depositMode === "token0-only"} />
+              <Input type="number" placeholder="0.00" value={amountB} onChange={(e) => { setAmountB(e.target.value); setAmountBIsAuto(false); setAutoCalcAmounts(null); }} className="flex-1 bg-slate-800 border-slate-600" disabled={depositMode === "token0-only"} />
               <Button variant="outline" onClick={() => setShowTokenBSelector(true)} className="min-w-[120px]">
                 {tokenB ? <div className="flex items-center gap-2">{tokenB.logoURI && <img src={tokenB.logoURI} alt={tokenB.symbol} className="w-5 h-5 rounded-full" />}<span>{tokenB.symbol}</span></div> : "Select Token"}
               </Button>
@@ -584,6 +712,10 @@ export function AddLiquidityV3Advanced() {
             </div>
           </div>
           {parseFloat(slippage) > 10 && <p className="text-xs text-amber-400">⚠ High slippage</p>}
+          <p className="text-xs text-slate-600">
+            Note: slippage tolerance is for display only. V3 mint uses 0 minimums
+            (safe — the contract adjusts amounts to the exact pool ratio).
+          </p>
         </CardContent>
       </Card>
 
@@ -602,7 +734,7 @@ export function AddLiquidityV3Advanced() {
           disabled={
             !tokenA || !tokenB || !ticksValid || isAdding ||
             (depositMode !== "token1-only" && (!amountA || parseFloat(amountA) <= 0)) ||
-            ((depositMode === "dual" || depositMode === "unknown" || depositMode === "token1-only") && (!amountB || parseFloat(amountB) <= 0))
+            ((depositMode === "dual" || depositMode === "unknown" || depositMode === "token1-only") && (!amountB || parseFloat(amountB) < 0))
           }>
           {addButtonLabel()}
         </Button>
