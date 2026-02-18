@@ -263,6 +263,3 @@ Add tokens to `client/src/data/tokens.ts`:
 
 ---
 
-## License
-
-MIT License - see LICENSE file for details
