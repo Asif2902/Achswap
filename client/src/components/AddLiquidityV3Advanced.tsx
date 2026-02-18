@@ -106,7 +106,7 @@ export function AddLiquidityV3Advanced() {
   const feeOptions = [
     { value: V3_FEE_TIERS.LOWEST,     label: "0.01%", description: "Very stable pairs" },
     { value: V3_FEE_TIERS.LOW,        label: "0.05%", description: "Stable pairs" },
-    { value: V3_FEE_TIERS.MEDIUM,     label: "0.3%",  description: "Most pairs (recommended)" },
+    { value: V3_FEE_TIERS.MEDIUM,     label: "0.3%",  description: "Most pairs" },
     { value: V3_FEE_TIERS.HIGH,       label: "1%",    description: "Exotic/volatile pairs" },
     { value: V3_FEE_TIERS.ULTRA_HIGH, label: "10%",   description: "Very exotic pairs" },
   ];
