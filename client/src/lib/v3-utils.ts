@@ -129,7 +129,7 @@ export function getTickSpacing(fee: number): number {
     case 500: return 10;     // 0.05%
     case 3000: return 60;    // 0.3%
     case 10000: return 200;  // 1%
-    case 100000: return 200; // 10%
+    case 100000: return 2000; // 10%
     default: return 60;
   }
 }
