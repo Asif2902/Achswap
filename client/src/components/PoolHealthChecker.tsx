@@ -446,7 +446,7 @@ export function PoolHealthChecker({
 
         {poolAddress && (
           <a
-            href={`https://scan.testnet.arc.network/address/${poolAddress}`}
+            href={`https://testnet.arcscan.app/address/${poolAddress}`}
             target="_blank"
             rel="noopener noreferrer"
           >
