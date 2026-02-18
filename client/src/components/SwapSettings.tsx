@@ -104,7 +104,7 @@ export function SwapSettings({
             
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label className="text-sm font-medium text-white">Uniswap V2</Label>
+                <Label className="text-sm font-medium text-white">Achswap V2</Label>
                 <p className="text-xs text-slate-400">Classic constant product AMM</p>
               </div>
               <Switch
@@ -116,7 +116,7 @@ export function SwapSettings({
             
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label className="text-sm font-medium text-white">Uniswap V3</Label>
+                <Label className="text-sm font-medium text-white">Achswap V3</Label>
                 <p className="text-xs text-slate-400">Concentrated liquidity pools</p>
               </div>
               <Switch
